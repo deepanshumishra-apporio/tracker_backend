@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.db
+.env
+downloaded_files/
+latest_logs/
+*.lock
+*.log
+.git/
+.gitignore
+tests/
