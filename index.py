@@ -114,9 +114,12 @@ app = create_app()
 if __name__ == "__main__":
     import uvicorn
 
+    # Bind 0.0.0.0 by default so it works on hosts like Render/Railway/Docker
+    # (they route to the container's public interface, not localhost). PORT is
+    # provided by the platform.
     uvicorn.run(
         "index:app",
-        host=os.getenv("HOST", "127.0.0.1"),
+        host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
         reload=bool(os.getenv("RELOAD", "")),
     )
