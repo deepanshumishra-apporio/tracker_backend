@@ -1,0 +1,18 @@
+# Scraping engine — SeleniumBase UC/CDP Mode (purpose-built anti-bot-detection)
+seleniumbase>=4.33.0       # UC Mode: beats Cloudflare/DataDome/Imperva; proxy+CAPTCHA built in
+
+# Web API (serves normalized data to the Next.js frontend)
+fastapi>=0.115.0          # typed REST API over the SQLite store
+uvicorn[standard]>=0.34.0 # ASGI server for FastAPI
+
+# Tests
+pytest>=8.3.0             # backend API test suite
+httpx>=0.28.0             # used by fastapi.testclient
+
+# Data + reliability
+pydantic>=2.10.0          # normalize all carriers into one data shape
+tenacity>=9.0.0           # retry with exponential backoff on blocks
+python-dotenv>=1.0.1      # load config/secrets from .env
+
+# Storage: SQLite is built into Python stdlib — no dependency needed.
+# SeleniumBase manages its own chromedriver automatically — no manual driver install.

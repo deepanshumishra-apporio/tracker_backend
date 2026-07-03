@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# SQLite (optional batch scraper output — never commit)
+*.db
+
+# Secrets / local env
+.env
+
+# SeleniumBase runtime artifacts (auto-downloaded)
+downloaded_files/
+latest_logs/
+*.lock
+
+# Misc
+*.log
+.DS_Store
+Thumbs.db
