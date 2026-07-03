@@ -69,14 +69,18 @@ def create_app() -> FastAPI:
         description="Live UPS / FedEx / DHL / Aramex tracking (no storage).",
     )
 
-    # CORS — allow the Next.js frontend origins (override via CORS_ORIGINS).
-    origins = os.getenv(
-        "CORS_ORIGINS",
-        "http://localhost:3000,http://127.0.0.1:3000",
-    ).split(",")
+    # CORS — allowed frontend origins. Defaults include the deployed Vercel app
+    # and local dev; extra origins can be appended via CORS_ORIGINS.
+    default_origins = [
+        "https://tracker-frontend-tawny.vercel.app",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+    extra = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+    origins = default_origins + extra
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[o.strip() for o in origins if o.strip()],
+        allow_origins=origins,
         allow_methods=["*"],
         allow_headers=["*"],
     )
