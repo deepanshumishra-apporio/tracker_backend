@@ -10,7 +10,9 @@ services:
     healthCheckPath: /api/health
     envVars:
       - key: HEADLESS
-        value: "true"
+        value: "false"
+      - key: SOLVE_CAPTCHA
+        value: "false"
       - key: MAX_RETRIES
         value: "2"
       # Deployed frontend origin(s), comma-separated. Exact — no trailing slash.

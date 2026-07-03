@@ -44,6 +44,11 @@ RECONNECT_TIME = float(os.getenv("RECONNECT_TIME", "4"))
 # a virtual display (Xvfb on Linux). Set HEADLESS=true only if you must.
 HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
+# Run the browser headed inside a virtual display (Xvfb) — Linux servers only.
+# Much harder for anti-bot (Akamai/DataDome) to detect than headless. The Docker
+# image sets this true; ignored on Windows/macOS.
+USE_XVFB = os.getenv("USE_XVFB", "false").lower() == "true"
+
 # Try to auto-click Cloudflare/reCAPTCHA if a challenge appears.
 SOLVE_CAPTCHA = os.getenv("SOLVE_CAPTCHA", "true").lower() == "true"
 

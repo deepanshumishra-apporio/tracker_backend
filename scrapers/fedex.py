@@ -248,6 +248,15 @@ class FedExScraper(BaseScraper):
         summary_lines = [ln.strip() for ln in summary.split("\n") if ln.strip()]
         summary_upper = [ln.upper() for ln in summary_lines]
 
+        # FedEx purges tracking numbers a while after delivery — distinguish
+        # "not found" from a page/parse problem so it's not mistaken for a bug.
+        low = summary.lower()
+        if "can't find that tracking number" in low or "check with the shipper" in low:
+            return TrackingResult.failure(
+                tracking_number, self.carrier,
+                "tracking number not found (FedEx has no record — it may be "
+                "invalid or aged out after delivery)")
+
         # Origin / destination: the line following FROM / (last) TO. Guard against
         # a status/milestone word leaking in (e.g. "Label created") when the page
         # has no real location there.

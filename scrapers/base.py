@@ -82,6 +82,10 @@ class BaseScraper(ABC):
         with SB(
             uc=True,
             headless=config.HEADLESS,
+            # On Linux servers, run headed inside a virtual display (Xvfb) instead
+            # of headless — UC Mode is far harder to detect this way (needed for
+            # Akamai-protected FedEx). Ignored on Windows/macOS.
+            xvfb=config.USE_XVFB,
             proxy=config.proxy_or_none(),
             locale_code="en",
             ad_block=True,
@@ -94,10 +98,12 @@ class BaseScraper(ABC):
                                       reconnect_time=config.RECONNECT_TIME)
 
             # If a Cloudflare/Turnstile checkbox appears, try to click it.
+            # Catch BaseException: headless servers have no display and pyautogui
+            # raises SystemExit (missing tkinter) — must not kill the scrape.
             if config.SOLVE_CAPTCHA:
                 try:
                     sb.uc_gui_click_captcha()
-                except Exception:
+                except BaseException:
                     pass  # no captcha present, or GUI-click unavailable
 
             self._check_block(sb)
