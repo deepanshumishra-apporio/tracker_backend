@@ -85,6 +85,9 @@ class BaseScraper(ABC):
             proxy=config.proxy_or_none(),
             locale_code="en",
             ad_block=True,
+            # Required for Chrome inside containers (runs as root, no /dev/shm).
+            # Harmless on desktop; makes the Docker/Render deploy work.
+            chromium_arg="--no-sandbox,--disable-dev-shm-usage",
         ) as sb:
             # Open the public page in stealth mode; this clears most bot checks.
             sb.uc_open_with_reconnect(self.build_url(tracking_number),
