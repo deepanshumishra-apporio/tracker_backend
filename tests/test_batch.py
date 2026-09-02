@@ -186,7 +186,11 @@ def test_invalid_rows_are_kept_with_an_error():
     assert errors[2] == "Missing AWB number."
     assert errors[3] == "Missing company."
     assert "letters, digits" in errors[4]
-    assert "Duplicate" in errors[5]
+    # A repeat names the row it repeats, so the user knows where the answer is.
+    assert errors[5].startswith("Same AWB as row 2")
+    assert parsed.rows[5].duplicate is True
+    assert parsed.rows[5].duplicate_of == 2
+    assert parsed.rows[parsed.rows[5].duplicate_of_index].row_number == 2
     assert len(parsed.valid_rows) == 1
 
 
@@ -407,6 +411,64 @@ def test_duplicates_are_their_own_state_not_a_problem(client: TestClient, monkey
     assert any("repeat an AWB" in n for n in done["notes"])
 
 
+def test_a_duplicate_carries_the_result_of_the_row_it_repeats(
+    client: TestClient, monkeypatch
+):
+    """Every row shows the shipment's data, and says where it came from."""
+    dhl = _FakeScraper(Carrier.DHL)
+    monkeypatch.setitem(index.SCRAPERS, Carrier.DHL, dhl)
+
+    job = upload(
+        client, make_xlsx([["DHL", "111"], ["DHL", "111"], ["dhl", "111"]])
+    ).json()
+    done = wait_for(client, job["id"])
+
+    source = next(r for r in done["rows"] if r["state"] == "done")
+    dupes = [r for r in done["rows"] if r["state"] == "duplicate"]
+
+    assert dhl.calls == ["111"], "still exactly one lookup"
+    assert len(dupes) == 2
+    for dup in dupes:
+        assert dup["duplicate_of"] == source["row_number"]
+        assert dup["result"] == source["result"], "the same shipment, same data"
+        assert dup["status"] == source["status"]
+        assert f"row {source['row_number']}" in dup["error"]
+
+    # One parcel, however many lines quote it.
+    assert done["counts"]["delivered"] == 1
+
+
+def test_a_duplicate_of_a_failed_row_says_so(client: TestClient, monkeypatch):
+    monkeypatch.setitem(index.SCRAPERS, Carrier.DHL, _FakeScraper(boom="wall"))
+    job = upload(client, make_xlsx([["DHL", "111"], ["DHL", "111"]])).json()
+    done = wait_for(client, job["id"])
+
+    dup = next(r for r in done["rows"] if r["state"] == "duplicate")
+    assert "couldn't be tracked" in dup["error"]
+    assert "wall" in dup["error"]
+
+
+def test_the_export_names_the_duplicated_row(client: TestClient, monkeypatch):
+    monkeypatch.setitem(index.SCRAPERS, Carrier.DHL, _FakeScraper(Carrier.DHL))
+    job = upload(client, make_xlsx([["DHL", "111"], ["DHL", "111"]])).json()
+    wait_for(client, job["id"])
+
+    wb = load_workbook(
+        io.BytesIO(client.get(f"/api/batch/{job['id']}/export.xlsx").content)
+    )
+    ws = wb["Tracking results"]
+    header = [c.value for c in ws[1]]
+    col = header.index("Duplicate of row") + 1
+    status = header.index("Status") + 1
+
+    assert ws.cell(row=2, column=col).value is None, "the source row repeats nothing"
+    assert ws.cell(row=3, column=col).value == 2, "row 3 repeats file row 2"
+    # The duplicate is not a data-less row any more.
+    assert ws.cell(row=3, column=status).value == "Delivered"
+    # ...but one shipment's history is listed once.
+    assert wb["Event history"].max_row == 2
+
+
 def test_a_duplicate_row_keeps_its_carrier_for_the_ui(client: TestClient, monkeypatch):
     monkeypatch.setitem(index.SCRAPERS, Carrier.DHL, _FakeScraper(Carrier.DHL))
     job = upload(client, make_xlsx([["DHL", "111"], ["DHL Express", "111"]])).json()
@@ -414,6 +476,44 @@ def test_a_duplicate_row_keeps_its_carrier_for_the_ui(client: TestClient, monkey
 
     dup = next(r for r in done["rows"] if r["state"] == "duplicate")
     assert dup["carrier"] == "dhl", "the badge should still show which carrier it was"
+
+
+# ---------------------------------------------------------------------------
+# Work planning — spare workers must land on the carrier that has the rows
+# ---------------------------------------------------------------------------
+def _unit_sizes(groups, concurrency):
+    return sorted(len(rows) for _, rows in batch._plan_units(groups, concurrency))
+
+
+def test_one_unit_per_carrier_when_concurrency_is_one():
+    groups = {"ups": [1] * 180, "dhl": [1] * 3}
+    units = batch._plan_units(groups, 1)
+    assert [c for c, _ in units] == ["ups", "dhl"]
+    assert _unit_sizes(groups, 1) == [3, 180]
+
+
+def test_the_biggest_carrier_is_split_across_spare_workers():
+    """180 UPS + 3 DHL used to leave 3 workers idle behind one 180-row browser."""
+    groups = {"ups": [1] * 180, "dhl": [1] * 3}
+    units = batch._plan_units(groups, 4)
+    assert len(units) == 4
+    assert [c for c, _ in units].count("ups") == 3
+    assert _unit_sizes(groups, 4) == [3, 45, 45, 90]
+    assert sum(len(rows) for _, rows in units) == 183, "no row lost or duplicated"
+
+
+def test_every_row_is_planned_exactly_once():
+    groups = {"ups": list(range(7)), "aramex": list(range(5))}
+    units = batch._plan_units(groups, 6)
+    planned = [row for _, rows in units for row in rows]
+    assert sorted(planned) == sorted(list(range(7)) + list(range(5)))
+    for carrier, rows in units:
+        assert rows, "an empty unit would open a browser for nothing"
+
+
+def test_planning_stops_when_there_is_nothing_left_to_split():
+    groups = {"dhl": [1]}
+    assert len(batch._plan_units(groups, 8)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -455,12 +555,28 @@ def test_a_carriers_rows_share_one_browser(client: TestClient, monkeypatch):
     monkeypatch.setitem(index.SCRAPERS, Carrier.UPS, ups)
 
     rows = [["UPS", f"1Z{i:06d}"] for i in range(20)]
-    job = upload(client, make_xlsx(rows)).json()
+    job = upload(client, make_xlsx(rows), concurrency=1).json()
     done = wait_for(client, job["id"])
 
     assert done["counts"]["done"] == 20
     assert len(ups.calls) == 20
     assert ups.sessions == 1, "each row opened its own browser again"
+
+
+def test_concurrency_buys_browsers_per_worker_not_per_row(
+    client: TestClient, monkeypatch
+):
+    """The point of the split: 4 workers on one carrier, still not 20 browsers."""
+    ups = _SessionScraper(Carrier.UPS)
+    monkeypatch.setitem(index.SCRAPERS, Carrier.UPS, ups)
+
+    rows = [["UPS", f"1Z{i:06d}"] for i in range(20)]
+    job = upload(client, make_xlsx(rows), concurrency=4).json()
+    done = wait_for(client, job["id"])
+
+    assert done["counts"]["done"] == 20
+    assert sorted(ups.calls) == sorted(f"1Z{i:06d}" for i in range(20))
+    assert ups.sessions == 4, "the spare workers should each get a share"
 
 
 def test_each_carrier_gets_its_own_session(client: TestClient, monkeypatch):
@@ -470,7 +586,7 @@ def test_each_carrier_gets_its_own_session(client: TestClient, monkeypatch):
 
     # Interleaved in the file — grouping must still collapse them to one each.
     rows = [["UPS", "1Z1"], ["DHL", "D1"], ["UPS", "1Z2"], ["DHL", "D2"]]
-    job = upload(client, make_xlsx(rows)).json()
+    job = upload(client, make_xlsx(rows), concurrency=1).json()
     done = wait_for(client, job["id"])
 
     assert done["counts"]["done"] == 4

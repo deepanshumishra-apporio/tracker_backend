@@ -142,14 +142,23 @@ class ParsedRow:
     awb: str
     carrier: Optional[Carrier] = None
     error: Optional[str] = None
-    # A repeat of an earlier (carrier, awb). Tracked separately from `error`
-    # because a duplicate is not something the user needs to fix — real files
-    # legitimately repeat a waybill across order lines.
-    duplicate: bool = False
+    # Source row (file line) this one repeats, when it repeats an earlier
+    # (carrier, awb). Tracked separately from `error` because a duplicate is
+    # not something the user needs to fix — real files legitimately repeat a
+    # waybill across order lines — and the user needs to know WHICH row holds
+    # the answer, not just that one exists somewhere above.
+    duplicate_of: Optional[int] = None
+    # Position of that source row within the file's parsed rows, so the job can
+    # copy its result across once it has been tracked.
+    duplicate_of_index: Optional[int] = None
 
     @property
     def valid(self) -> bool:
         return self.error is None
+
+    @property
+    def duplicate(self) -> bool:
+        return self.duplicate_of is not None
 
 
 @dataclass
@@ -246,7 +255,9 @@ def parse_workbook(filename: str, data: bytes) -> ParsedFile:
     rows: list[ParsedRow] = []
     skipped_blank = 0
     truncated = False
-    seen: set[tuple[str, str]] = set()
+    # (carrier, AWB) -> (index, row) of the row that claimed it first, so a
+    # repeat can point at it and later copy its result.
+    seen: dict[tuple[str, str], tuple[int, ParsedRow]] = {}
 
     for offset, raw in enumerate(table[header_idx + 1:], start=header_idx + 2):
         company = _cell_text(raw[company_col] if company_col < len(raw) else "")
@@ -275,13 +286,19 @@ def parse_workbook(filename: str, data: bytes) -> ParsedFile:
             row.error = "AWB is too long (max 64 characters)."
         else:
             key = (carrier.value, awb.upper())
-            if key in seen:
-                row.error = "Duplicate of an earlier row — tracked once."
-                row.duplicate = True
-                row.carrier = carrier
+            row.carrier = carrier
+            first = seen.get(key)
+            if first is not None:
+                first_index, first_row = first
+                row.duplicate_of = first_row.row_number
+                row.duplicate_of_index = first_index
+                row.error = (
+                    f"Same AWB as row {first_row.row_number} — tracked once "
+                    "there, and that row's result is shown here too."
+                )
             else:
-                seen.add(key)
-                row.carrier = carrier
+                # len(rows) is where this row is about to land.
+                seen[key] = (len(rows), row)
         rows.append(row)
 
     if not rows:
@@ -309,11 +326,16 @@ class JobRow:
     awb: str
     carrier: Optional[str] = None
     # queued -> running -> done | failed | skipped (skipped = invalid input)
+    # duplicate rows never run; they mirror the row they repeat.
     state: str = "queued"
     error: Optional[str] = None
     result: Optional[dict[str, Any]] = None
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
+    # File line this row repeats (None unless it is a duplicate), plus that
+    # row's position in the job so its result can be copied here.
+    duplicate_of: Optional[int] = None
+    duplicate_of_index: Optional[int] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -327,6 +349,7 @@ class JobRow:
             "result": self.result,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
+            "duplicate_of": self.duplicate_of,
             "status": (self.result or {}).get("status"),
         }
 
@@ -342,6 +365,9 @@ class BatchJob:
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     notes: list[str] = field(default_factory=list)
+    # source row index -> the duplicate rows that mirror it. Built once at
+    # creation so finishing a row can fill in its repeats without a scan.
+    mirrors: dict[int, list[JobRow]] = field(default_factory=dict, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _cancel: threading.Event = field(default_factory=threading.Event, repr=False)
 
@@ -352,11 +378,15 @@ class BatchJob:
         for row in self.rows:
             c[row.state] = c.get(row.state, 0) + 1
         c["finished"] = c["done"] + c["failed"] + c["skipped"] + c["duplicate"]
+        # Status tallies count shipments we tracked, not rows carrying a copy of
+        # one: a waybill repeated 15 times is one delivered parcel, and counting
+        # the copies would report more deliveries than the file has shipments.
+        tracked = [r for r in self.rows if r.state == "done"]
         c["delivered"] = sum(
-            1 for r in self.rows if (r.result or {}).get("status") == Status.DELIVERED.value
+            1 for r in tracked if (r.result or {}).get("status") == Status.DELIVERED.value
         )
         c["in_transit"] = sum(
-            1 for r in self.rows
+            1 for r in tracked
             if (r.result or {}).get("status") in {
                 Status.IN_TRANSIT.value, Status.OUT_FOR_DELIVERY.value, Status.PENDING.value
             }
@@ -388,6 +418,7 @@ class BatchJob:
                     if row.state == "queued":
                         row.state = "skipped"
                         row.error = "Cancelled before this row ran."
+                        _mirror(self, row)
                 self.state = "cancelled"
                 self.finished_at = _now()
 
@@ -451,9 +482,15 @@ class JobRegistry:
                 carrier=p.carrier.value if p.carrier else None,
                 state=("duplicate" if p.duplicate else "skipped" if not p.valid else "queued"),
                 error=p.error,
+                duplicate_of=p.duplicate_of,
+                duplicate_of_index=p.duplicate_of_index,
             )
             for i, p in enumerate(parsed.rows)
         ]
+        mirrors: dict[int, list[JobRow]] = defaultdict(list)
+        for row in rows:
+            if row.duplicate_of_index is not None:
+                mirrors[row.duplicate_of_index].append(row)
         notes: list[str] = []
         if parsed.truncated:
             notes.append(f"Only the first {MAX_ROWS} rows were taken from this file.")
@@ -464,9 +501,12 @@ class JobRegistry:
             notes.append(f"{invalid} row(s) couldn't be tracked — see the errors below.")
         repeats = sum(1 for r in rows if r.state == "duplicate")
         if repeats:
+            unique = len(mirrors)
             notes.append(
-                f"{repeats} row(s) repeat an AWB listed earlier — each shipment is "
-                "tracked once."
+                f"{repeats} row(s) repeat an AWB from an earlier row "
+                f"({unique} waybill(s) affected) — each shipment is tracked once "
+                "and every repeat shows the same result, labelled with the row it "
+                "came from."
             )
 
         job = BatchJob(
@@ -475,6 +515,7 @@ class JobRegistry:
             rows=rows,
             created_at=_now(),
             notes=notes,
+            mirrors=dict(mirrors),
         )
         self._register(job)
         self._start(job, session_factory, concurrency)
@@ -500,18 +541,19 @@ class JobRegistry:
         for row in pending:
             groups[row.carrier or ""].append(row)
 
+        units = _plan_units(groups, concurrency)
+
         def worker() -> None:
             job.state = "running"
             job.started_at = _now()
-            # One worker per carrier group at most; concurrency still caps it.
-            workers = max(1, min(concurrency, len(groups)))
+            workers = max(1, min(concurrency, len(units)))
             try:
                 with ThreadPoolExecutor(
                     max_workers=workers, thread_name_prefix=f"batch-{job.id}"
                 ) as pool:
                     for _ in pool.map(
                         lambda item: _run_group(job, item[0], item[1], session_factory),
-                        list(groups.items()),
+                        units,
                     ):
                         pass
             finally:
@@ -525,6 +567,30 @@ class JobRegistry:
         ).start()
 
 
+def _plan_units(
+    groups: dict[str, list[JobRow]], concurrency: int
+) -> list[tuple[str, list[JobRow]]]:
+    """Split the carrier groups into up to `concurrency` browsers of work.
+
+    One unit per carrier is the floor — a browser only ever visits one carrier's
+    site. But a file is rarely balanced: 180 UPS rows next to 3 DHL rows left
+    three workers idle while the UPS browser ground through the whole run alone,
+    so the wall clock was the biggest group no matter what concurrency said.
+    Repeatedly halving the largest remaining unit spreads the spare workers onto
+    whichever carrier actually has the rows.
+    """
+    units = [(carrier, list(rows)) for carrier, rows in groups.items() if rows]
+    while len(units) < concurrency:
+        biggest = max(range(len(units)), key=lambda i: len(units[i][1]))
+        carrier, rows = units[biggest]
+        if len(rows) < 2:
+            break  # nothing left worth splitting
+        half = len(rows) // 2
+        units[biggest] = (carrier, rows[:half])
+        units.append((carrier, rows[half:]))
+    return units
+
+
 def _run_group(
     job: BatchJob,
     carrier: str,
@@ -533,7 +599,7 @@ def _run_group(
 ) -> None:
     """Run every row for one carrier through a single shared browser."""
     if job.cancelled:
-        _abandon(rows, "Cancelled before this row ran.", state="skipped")
+        _abandon(rows, "Cancelled before this row ran.", state="skipped", job=job)
         return
     try:
         with session_factory(Carrier(carrier)) as track:
@@ -542,15 +608,38 @@ def _run_group(
     except Exception as exc:
         # The session itself could not be opened or died unrecoverably; the
         # rows it never reached would otherwise hang in "queued" forever.
-        _abandon(rows, humanize_error(exc), state="failed")
+        _abandon(rows, humanize_error(exc), state="failed", job=job)
 
 
-def _abandon(rows: list[JobRow], message: str, *, state: str) -> None:
+def _abandon(
+    rows: list[JobRow], message: str, *, state: str, job: Optional[BatchJob] = None
+) -> None:
     for row in rows:
         if row.state in ("queued", "running"):
             row.state = state
             row.error = message
             row.finished_at = _now()
+            if job is not None:
+                _mirror(job, row)
+
+
+def _mirror(job: BatchJob, source: JobRow) -> None:
+    """Copy a finished row's outcome onto every row that repeats its AWB.
+
+    A duplicate is the same shipment, so leaving those rows blank forced the
+    user to hunt up the sheet for the row that holds the answer. They keep the
+    "duplicate" state (they cost no lookup and must not inflate the tallies)
+    but carry the same result, and their note names the row it came from.
+    """
+    for row in job.mirrors.get(source.index, ()):
+        row.result = source.result
+        row.started_at = source.started_at
+        row.finished_at = source.finished_at
+        if source.error:
+            row.error = (
+                f"Same AWB as row {source.row_number}, which couldn't be "
+                f"tracked: {source.error}"
+            )
 
 
 def _run_row(
@@ -586,6 +675,7 @@ def _run_row(
         ).model_dump(mode="json")
     finally:
         row.finished_at = _now()
+        _mirror(job, row)
 
 
 JOBS = JobRegistry()
@@ -602,13 +692,16 @@ _RESULT_COLUMNS: list[tuple[str, Callable[[JobRow], Any]]] = [
     ("Company", lambda r: r.company),
     ("AWB", lambda r: r.awb),
     ("Carrier", lambda r: (r.carrier or "").upper()),
-    # Only a successfully tracked row has a real carrier status. A failed one
-    # carries the placeholder "unknown", which would read as real data here —
-    # the State + Error columns say what actually happened.
+    # Only a row with a real lookup behind it has a carrier status — its own
+    # (done) or the one it mirrors (duplicate). A failed row carries the
+    # placeholder "unknown", which would read as real data here; its State +
+    # Error columns say what actually happened.
     ("Status", lambda r: _status_label(
-        (r.result or {}).get("status") if r.state == "done" else None
+        (r.result or {}).get("status") if r.state in ("done", "duplicate") else None
     )),
     ("State", lambda r: r.state),
+    # Which row this one repeats — blank for the 99% that repeat nothing.
+    ("Duplicate of row", lambda r: r.duplicate_of),
     ("Origin", lambda r: (r.result or {}).get("origin")),
     ("Destination", lambda r: (r.result or {}).get("destination")),
     ("Service", lambda r: (r.result or {}).get("service")),
@@ -675,15 +768,22 @@ def build_results_xlsx(job: BatchJob) -> bytes:
 
     # Second sheet: the full event history, one line per scan.
     hist = wb.create_sheet("Event history")
-    hist_headers = ["AWB", "Carrier", "Timestamp", "Status", "Location", "Description"]
+    hist_headers = ["Row", "AWB", "Carrier", "Timestamp", "Status", "Location",
+                    "Description"]
     hist.append(hist_headers)
     for cell in hist[1]:
         cell.fill = _HEADER_FILL
         cell.font = _HEADER_FONT
     hist_widths = {i: len(h) for i, h in enumerate(hist_headers, start=1)}
     for row in job.rows:
+        # Duplicates hold a copy of another row's events; listing them again
+        # would repeat one shipment's history once per order line. The main
+        # sheet's "Duplicate of row" column points at the row listed here.
+        if row.state == "duplicate":
+            continue
         for event in (row.result or {}).get("events") or []:
             values = [
+                row.row_number,
                 row.awb,
                 (row.carrier or "").upper(),
                 event.get("timestamp"),
