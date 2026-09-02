@@ -39,6 +39,17 @@ class Blocked(Exception):
     """Raised when we detect a block/CAPTCHA wall so tenacity retries (new IP)."""
 
 
+class PageLoadFailed(Exception):
+    """Raised when the navigation never reached the carrier at all.
+
+    Chrome answers a failed connection with its own error page, whose document
+    is empty. Parsing on regardless is what turned a dead proxy into a flood of
+    "no status found (invalid number or page changed)" rows — the tracking
+    numbers were fine; nothing had loaded. Transient by nature (a rotating proxy
+    hands out a new exit IP on the next launch), so the row is retried.
+    """
+
+
 # Serializes browser STARTUP across threads (the bulk runner scrapes rows in
 # parallel). Two SB() instances booting at once race on shared state that
 # SeleniumBase writes per-process — most visibly the ad-block extension it
@@ -47,6 +58,12 @@ class Blocked(Exception):
 # keeps two Chromes from allocating simultaneously and OOM-killing each other.
 # Only startup is serialized; page work still overlaps.
 _BROWSER_START_LOCK = threading.Lock()
+
+
+def _cap(text: str) -> str:
+    """One readable line: drop Selenium's stack frames and cap the length."""
+    first = re.split(r"\bStacktrace\b|\n", text, maxsplit=1)[0].strip()
+    return (first[:197] + "…") if len(first) > 200 else first
 
 
 def humanize_error(exc: BaseException) -> str:
@@ -59,7 +76,15 @@ def humanize_error(exc: BaseException) -> str:
     text = str(exc) or exc.__class__.__name__
     lowered = text.lower()
 
+    if isinstance(exc, PageLoadFailed):
+        # Already written for the user, and it names the setting to change.
+        return _cap(text)
     if isinstance(exc, Blocked) or "captcha" in lowered or "bot-check" in lowered:
+        # A block that already carries its own diagnosis (UPS's rate-limit
+        # message, raised so the row retries on a fresh IP) keeps it — the
+        # generic wording would throw away the one line that says what to do.
+        if "rate-limiting" in lowered:
+            return _cap(text)
         return "The carrier's bot-check blocked us. Retrying with a new IP may help."
     if (
         "invalid session id" in lowered
@@ -80,8 +105,7 @@ def humanize_error(exc: BaseException) -> str:
 
     # Unknown: keep the first line only, and cap it. Selenium appends
     # "Stacktrace:" followed by dozens of hex frames — never useful here.
-    first = re.split(r"\bStacktrace\b|\n", text, maxsplit=1)[0].strip()
-    return (first[:197] + "…") if len(first) > 200 else (first or "Unknown error.")
+    return _cap(text) or "Unknown error."
 
 
 # Text markers that mean "we got walled, not real content".
@@ -116,6 +140,37 @@ class BaseScraper(ABC):
         return config.proxy_or_none()
 
     # ---- shared machinery ------------------------------------------------
+    def _require_loaded(self, sb) -> None:
+        """Raise unless the browser is actually sitting on the carrier's page.
+
+        Chrome swaps the URL for ``chrome-error://chromewebdata/`` and serves an
+        empty document when the connection fails — a proxy that refuses to
+        tunnel being the usual reason. Every scraper downstream then sees a page
+        with no shipment on it and reports the tracking number as invalid, which
+        is the wrong diagnosis and the expensive kind: 11 of 12 UPS rows in a
+        bulk run "failed" that way while the same numbers tracked fine with
+        USE_PROXIES=false. Check once, here, for all four carriers.
+        """
+        try:
+            href = sb.execute_script("return location.href") or ""
+        except Exception:
+            return  # can't ask the page; let the normal parse path report
+        if href.startswith("chrome-error://"):
+            raise PageLoadFailed(self._load_failure_message())
+
+    def _load_failure_message(self) -> str:
+        """Why the page didn't load, phrased as something the user can act on."""
+        if self.get_proxy():
+            return (
+                "The carrier's page never loaded — the proxy refused to connect. "
+                "Check PROXY_URL's credentials, or set USE_PROXIES=false in .env "
+                "to scrape without one."
+            )
+        return (
+            "The carrier's page never loaded — Chrome couldn't reach the site. "
+            "Check this machine's internet connection, then try again."
+        )
+
     def _check_block(self, sb) -> None:
         title = (sb.get_title() or "").lower()
         # Only sniff a small slice of source to keep it cheap.
@@ -197,6 +252,7 @@ class BaseScraper(ABC):
             except BaseException:
                 pass  # no captcha present, or GUI-click unavailable
 
+        self._require_loaded(sb)
         self._check_block(sb)
 
         api = self.api_url(tracking_number)
@@ -204,6 +260,7 @@ class BaseScraper(ABC):
             # Reuse the now-trusted session (cookies/fingerprint) to hit the
             # internal JSON endpoint directly — clean data, no HTML parsing.
             sb.uc_open_with_reconnect(api, reconnect_time=2)
+            self._require_loaded(sb)
             self._check_block(sb)
             body = sb.get_text("body")
             try:
@@ -236,7 +293,7 @@ class BaseScraper(ABC):
 # Exceptions that mean "try again on a fresh browser" rather than "this number
 # has no data". A not-found number is RETURNED as TrackingResult.failure(), so
 # it never lands here and never burns a retry.
-TRANSIENT = (Blocked, WebDriverException, OSError)
+TRANSIENT = (Blocked, PageLoadFailed, WebDriverException, OSError)
 
 
 class BrowserSession:

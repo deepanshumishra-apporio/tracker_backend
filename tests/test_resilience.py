@@ -20,7 +20,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config  # noqa: E402
 from models import Carrier, Status, TrackingResult  # noqa: E402
-from scrapers.base import Blocked, BaseScraper, humanize_error  # noqa: E402
+from scrapers.base import (  # noqa: E402
+    BaseScraper,
+    Blocked,
+    PageLoadFailed,
+    humanize_error,
+)
 
 # The real message UPS rows failed with, trimmed of most frames.
 SELENIUM_NOISE = (
@@ -109,6 +114,10 @@ class _FakeBrowser:
 
     def get_page_source(self):
         return "<html>tracking details</html>"
+
+    def execute_script(self, script):
+        # What the load guard asks for: the URL we actually ended up on.
+        return "https://www.ups.com/track?tracknum=1ZH40B480424822345"
 
 
 class _Scraper(BaseScraper):
@@ -223,6 +232,102 @@ def test_a_not_found_number_is_not_retried(browsers, no_backoff):
 
     assert result.ok is False
     assert calls["n"] == 1, "a genuine not-found must not burn retries"
+
+
+# ---------------------------------------------------------------------------
+# A page that never loaded must not be reported as a bad tracking number.
+# The 2026-09 bulk run failed 11 of 12 UPS rows with "no status found (invalid
+# number or page changed)" while the proxy was refusing every connection —
+# Chrome was serving its own error page and we parsed it as if it were the
+# carrier's. The same numbers tracked fine with USE_PROXIES=false.
+# ---------------------------------------------------------------------------
+class _DeadPageBrowser(_FakeBrowser):
+    """A browser whose navigation lands on Chrome's network-error page."""
+
+    def execute_script(self, script):
+        return "chrome-error://chromewebdata/"
+
+    def get_title(self):
+        return ""
+
+    def get_page_source(self):
+        return ""
+
+
+@pytest.fixture()
+def dead_pages(monkeypatch):
+    """Install a fake SB() that always fails to load; returns the call counter."""
+    calls = {"n": 0}
+
+    def factory(**kwargs):
+        calls["n"] += 1
+        return _DeadPageBrowser()
+
+    monkeypatch.setattr("scrapers.base.SB", factory)
+    return calls
+
+
+@pytest.fixture()
+def proxied(monkeypatch):
+    monkeypatch.setattr(config, "USE_PROXIES", True)
+    monkeypatch.setattr(config, "PROXY_URL", "user:pass@gate.example:7000")
+
+
+@pytest.fixture()
+def unproxied(monkeypatch):
+    monkeypatch.setattr(config, "USE_PROXIES", False)
+    monkeypatch.setattr(config, "PROXY_URL", "")
+
+
+def test_a_page_that_never_loaded_is_not_blamed_on_the_number(
+    dead_pages, proxied, no_backoff
+):
+    with pytest.raises(PageLoadFailed) as caught:
+        _Scraper().scrape("1ZH40B480424822345")
+
+    message = str(caught.value)
+    assert "never loaded" in message
+    assert "invalid" not in message.lower(), "must not blame the waybill"
+    assert dead_pages["n"] == config.MAX_RETRIES, "a dead load deserves a retry"
+
+
+def test_the_failure_names_the_proxy_when_one_is_configured(
+    dead_pages, proxied, no_backoff
+):
+    with pytest.raises(PageLoadFailed) as caught:
+        _Scraper().scrape("1ZH40B480424822345")
+
+    message = str(caught.value)
+    assert "proxy" in message
+    assert "USE_PROXIES=false" in message, "say which setting to change"
+
+
+def test_without_a_proxy_it_points_at_the_connection(
+    dead_pages, unproxied, no_backoff
+):
+    with pytest.raises(PageLoadFailed) as caught:
+        _Scraper().scrape("1ZH40B480424822345")
+
+    assert "internet connection" in str(caught.value)
+    assert "proxy" not in str(caught.value)
+
+
+def test_the_table_shows_the_load_failure_verbatim(proxied):
+    """humanize_error must keep the sentence that names the fix."""
+    message = humanize_error(PageLoadFailed(_Scraper()._load_failure_message()))
+    assert "never loaded" in message
+    assert "USE_PROXIES=false" in message
+    assert len(message) <= 200
+
+
+def test_a_loaded_page_is_left_alone(browsers, no_backoff):
+    """The guard must not fire on a real page — that would fail every row."""
+    calls, _ = browsers(fail_times=0, exc=RuntimeError("unused"))
+
+    result = _Scraper().scrape("1ZH40B480424822345")
+
+    assert result.ok is True
+    assert calls["n"] == 1
 
 
 # ---------------------------------------------------------------------------
