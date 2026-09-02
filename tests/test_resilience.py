@@ -288,3 +288,116 @@ def test_batch_concurrency_never_drops_below_one(monkeypatch):
     finally:
         monkeypatch.delenv("BATCH_CONCURRENCY", raising=False)
         importlib.reload(config)
+
+
+# ---------------------------------------------------------------------------
+# Browser reuse — the speed fix. Chrome startup was ~10-15s of every ~40s row.
+# ---------------------------------------------------------------------------
+def test_one_browser_serves_many_numbers(browsers, no_backoff):
+    """The whole point: 20 lookups must not cost 20 Chrome launches."""
+    calls, made = browsers(fail_times=0, exc=RuntimeError("unused"))
+    scraper = _Scraper()
+
+    with scraper.session(max_lookups=100) as s:
+        for i in range(20):
+            assert s.track(f"1Z{i}").ok is True
+
+    assert calls["n"] == 1, "each lookup launched its own browser again"
+    assert s.launches == 1
+    assert made[0].exited is True, "the session must close its browser on exit"
+
+
+def test_the_browser_is_recycled_after_the_reuse_budget(browsers, no_backoff):
+    """Riding one fingerprint forever is what anti-bot systems look for."""
+    calls, _ = browsers(fail_times=0, exc=RuntimeError("unused"))
+    scraper = _Scraper()
+
+    with scraper.session(max_lookups=5) as s:
+        for i in range(12):
+            s.track(f"1Z{i}")
+
+    assert calls["n"] == 3, "expected a fresh browser every 5 lookups"
+
+
+def test_a_crash_mid_session_relaunches_and_keeps_going(no_backoff, monkeypatch):
+    """One dead browser must cost one row a retry, not the rest of the run."""
+    launches = {"n": 0}
+    made: list[_FakeBrowser] = []
+
+    def factory(**kwargs):
+        launches["n"] += 1
+        b = _FakeBrowser()
+        made.append(b)
+        return b
+
+    monkeypatch.setattr("scrapers.base.SB", factory)
+
+    class _DiesOnce(_Scraper):
+        seen = 0
+
+        def parse_dom(self, sb, tracking_number):
+            _DiesOnce.seen += 1
+            if _DiesOnce.seen == 3:
+                raise InvalidSessionIdException(SELENIUM_NOISE)
+            return super().parse_dom(sb, tracking_number)
+
+    scraper = _DiesOnce()
+    with scraper.session(max_lookups=100) as s:
+        results = [s.track(f"1Z{i}") for i in range(5)]
+
+    assert all(r.ok for r in results), "a mid-run crash lost a row"
+    assert launches["n"] == 2, "the dead browser should have been replaced once"
+    assert all(b.exited for b in made), "the crashed browser leaked"
+
+
+def test_session_closes_its_browser_even_when_the_body_raises(browsers, no_backoff):
+    calls, made = browsers(fail_times=0, exc=RuntimeError("unused"))
+    scraper = _Scraper()
+
+    with pytest.raises(ValueError):
+        with scraper.session() as s:
+            s.track("1Z1")
+            raise ValueError("caller blew up")
+
+    assert made[0].exited is True
+
+
+def test_single_lookup_still_opens_and_closes_one_browser(browsers, no_backoff):
+    """scrape() is now a one-shot session; the single-shipment path is unchanged."""
+    calls, made = browsers(fail_times=0, exc=RuntimeError("unused"))
+
+    result = _Scraper().scrape("1ZH40B480424822345")
+
+    assert result.status is Status.DELIVERED
+    assert calls["n"] == 1
+    assert made[0].exited is True
+
+
+def test_a_carrier_without_a_browser_is_delegated(no_backoff, monkeypatch):
+    """FedEx over Scrape.do is a plain HTTP fetch — nothing to reuse."""
+
+    class _NoBrowser(_Scraper):
+        carrier = Carrier.FEDEX
+        scraped: list[str] = []
+
+        @property
+        def uses_shared_browser(self):
+            return False
+
+        def scrape(self, tracking_number):
+            _NoBrowser.scraped.append(tracking_number)
+            return TrackingResult(
+                tracking_number=tracking_number,
+                carrier=self.carrier,
+                status=Status.DELIVERED,
+            )
+
+    def boom(**kwargs):  # a browser must never be launched
+        raise AssertionError("launched a browser for a non-browser carrier")
+
+    monkeypatch.setattr("scrapers.base.SB", boom)
+
+    scraper = _NoBrowser()
+    with scraper.session() as s:
+        assert s.track("873815709010").ok is True
+    assert _NoBrowser.scraped == ["873815709010"]

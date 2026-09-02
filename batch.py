@@ -23,7 +23,9 @@ import io
 import re
 import threading
 import uuid
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
@@ -436,7 +438,7 @@ class JobRegistry:
     def create(
         self,
         parsed: ParsedFile,
-        scrape: Callable[[Carrier, str], dict[str, Any]],
+        session_factory: Callable[[Carrier], AbstractContextManager],
         *,
         concurrency: int = DEFAULT_CONCURRENCY,
     ) -> BatchJob:
@@ -475,13 +477,13 @@ class JobRegistry:
             notes=notes,
         )
         self._register(job)
-        self._start(job, scrape, concurrency)
+        self._start(job, session_factory, concurrency)
         return job
 
     def _start(
         self,
         job: BatchJob,
-        scrape: Callable[[Carrier, str], dict[str, Any]],
+        session_factory: Callable[[Carrier], AbstractContextManager],
         concurrency: int,
     ) -> None:
         pending = [r for r in job.rows if r.state == "queued"]
@@ -490,15 +492,27 @@ class JobRegistry:
             job.started_at = job.finished_at = _now()
             return
 
+        # Group by carrier so each group can share ONE browser. Opening Chrome
+        # costs ~10-15s of a ~40s lookup, and the old row-at-a-time loop paid it
+        # for every single row. Grouping also keeps a carrier's numbers on one
+        # warmed-up session instead of hopping between sites.
+        groups: dict[str, list[JobRow]] = defaultdict(list)
+        for row in pending:
+            groups[row.carrier or ""].append(row)
+
         def worker() -> None:
             job.state = "running"
             job.started_at = _now()
-            workers = max(1, min(concurrency, len(pending)))
+            # One worker per carrier group at most; concurrency still caps it.
+            workers = max(1, min(concurrency, len(groups)))
             try:
                 with ThreadPoolExecutor(
                     max_workers=workers, thread_name_prefix=f"batch-{job.id}"
                 ) as pool:
-                    for _ in pool.map(lambda r: _run_row(job, r, scrape), pending):
+                    for _ in pool.map(
+                        lambda item: _run_group(job, item[0], item[1], session_factory),
+                        list(groups.items()),
+                    ):
                         pass
             finally:
                 with job._lock:
@@ -511,12 +525,40 @@ class JobRegistry:
         ).start()
 
 
+def _run_group(
+    job: BatchJob,
+    carrier: str,
+    rows: list[JobRow],
+    session_factory: Callable[[Carrier], AbstractContextManager],
+) -> None:
+    """Run every row for one carrier through a single shared browser."""
+    if job.cancelled:
+        _abandon(rows, "Cancelled before this row ran.", state="skipped")
+        return
+    try:
+        with session_factory(Carrier(carrier)) as track:
+            for row in rows:
+                _run_row(job, row, track)
+    except Exception as exc:
+        # The session itself could not be opened or died unrecoverably; the
+        # rows it never reached would otherwise hang in "queued" forever.
+        _abandon(rows, humanize_error(exc), state="failed")
+
+
+def _abandon(rows: list[JobRow], message: str, *, state: str) -> None:
+    for row in rows:
+        if row.state in ("queued", "running"):
+            row.state = state
+            row.error = message
+            row.finished_at = _now()
+
+
 def _run_row(
     job: BatchJob,
     row: JobRow,
-    scrape: Callable[[Carrier, str], dict[str, Any]],
+    track: Callable[[str], dict[str, Any]],
 ) -> None:
-    """Scrape one row, recording state on the way. Never raises."""
+    """Scrape one row on an open session, recording state. Never raises."""
     if job.cancelled:
         if row.state == "queued":
             row.state = "skipped"
@@ -526,7 +568,7 @@ def _run_row(
     row.state = "running"
     row.started_at = _now()
     try:
-        result = scrape(Carrier(row.carrier), row.awb)
+        result = track(row.awb)
         row.result = result
         if result.get("ok"):
             row.state = "done"

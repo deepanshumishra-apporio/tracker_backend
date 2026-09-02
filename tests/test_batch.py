@@ -414,3 +414,89 @@ def test_a_duplicate_row_keeps_its_carrier_for_the_ui(client: TestClient, monkey
 
     dup = next(r for r in done["rows"] if r["state"] == "duplicate")
     assert dup["carrier"] == "dhl", "the badge should still show which carrier it was"
+
+
+# ---------------------------------------------------------------------------
+# Browser reuse across a bulk run
+# ---------------------------------------------------------------------------
+class _SessionScraper:
+    """A fake whose session() records how many browsers the run cost."""
+
+    def __init__(self, carrier: Carrier):
+        self.carrier = carrier
+        self.sessions = 0
+        self.calls: list[str] = []
+
+    def session(self, max_lookups=None):
+        scraper = self
+
+        class _S:
+            def __enter__(self):
+                scraper.sessions += 1
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def track(self, number):
+                scraper.calls.append(number)
+                return TrackingResult(
+                    tracking_number=number,
+                    carrier=scraper.carrier,
+                    status=Status.DELIVERED,
+                )
+
+        return _S()
+
+
+def test_a_carriers_rows_share_one_browser(client: TestClient, monkeypatch):
+    """20 UPS rows must cost 1 browser, not 20."""
+    ups = _SessionScraper(Carrier.UPS)
+    monkeypatch.setitem(index.SCRAPERS, Carrier.UPS, ups)
+
+    rows = [["UPS", f"1Z{i:06d}"] for i in range(20)]
+    job = upload(client, make_xlsx(rows)).json()
+    done = wait_for(client, job["id"])
+
+    assert done["counts"]["done"] == 20
+    assert len(ups.calls) == 20
+    assert ups.sessions == 1, "each row opened its own browser again"
+
+
+def test_each_carrier_gets_its_own_session(client: TestClient, monkeypatch):
+    ups, dhl = _SessionScraper(Carrier.UPS), _SessionScraper(Carrier.DHL)
+    monkeypatch.setitem(index.SCRAPERS, Carrier.UPS, ups)
+    monkeypatch.setitem(index.SCRAPERS, Carrier.DHL, dhl)
+
+    # Interleaved in the file — grouping must still collapse them to one each.
+    rows = [["UPS", "1Z1"], ["DHL", "D1"], ["UPS", "1Z2"], ["DHL", "D2"]]
+    job = upload(client, make_xlsx(rows)).json()
+    done = wait_for(client, job["id"])
+
+    assert done["counts"]["done"] == 4
+    assert ups.sessions == 1 and dhl.sessions == 1
+    assert ups.calls == ["1Z1", "1Z2"]
+    assert dhl.calls == ["D1", "D2"]
+
+
+def test_a_session_that_cannot_open_fails_its_rows_not_the_job(
+    client: TestClient, monkeypatch
+):
+    """Rows behind a dead session must not hang in 'queued' forever."""
+
+    class _Broken:
+        def session(self, max_lookups=None):
+            raise RuntimeError("Message: invalid session id Stacktrace: #0 0xdead")
+
+    monkeypatch.setitem(index.SCRAPERS, Carrier.UPS, _Broken())
+    monkeypatch.setitem(index.SCRAPERS, Carrier.DHL, _SessionScraper(Carrier.DHL))
+
+    job = upload(client, make_xlsx([["UPS", "1Z1"], ["UPS", "1Z2"], ["DHL", "D1"]])).json()
+    done = wait_for(client, job["id"])
+
+    assert done["state"] == "completed"
+    ups_rows = [r for r in done["rows"] if r["carrier"] == "ups"]
+    assert all(r["state"] == "failed" for r in ups_rows)
+    assert all("0x" not in (r["error"] or "") for r in ups_rows), "raw stack trace leaked"
+    # The other carrier is unaffected.
+    assert next(r for r in done["rows"] if r["carrier"] == "dhl")["state"] == "done"

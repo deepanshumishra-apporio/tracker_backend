@@ -126,22 +126,29 @@ class BaseScraper(ABC):
         if any(m in title or m in src for m in _BLOCK_MARKERS):
             raise Blocked("bot-check / CAPTCHA wall detected")
 
-    # Retry a blocked scrape (new IP may get through) AND a crashed browser.
-    # WebDriverException covers the whole family of "the browser died under us"
-    # failures — invalid session id, active window already closed, chromedriver
-    # connection refused — which are transient and almost always succeed on a
-    # fresh browser. Before this they were fatal for the row, which is what
-    # turned one memory spike into ~130 failed rows in a single bulk run.
-    # OSError catches the startup profile clash. A legitimately-not-found number
-    # returns TrackingResult.failure() rather than raising, so it is never
-    # retried and costs nothing.
-    @retry(
-        retry=retry_if_exception_type((Blocked, WebDriverException, OSError)),
-        stop=stop_after_attempt(config.MAX_RETRIES),
-        wait=wait_exponential(multiplier=2, min=4, max=60),
-        reraise=True,
-    )
-    def scrape(self, tracking_number: str) -> TrackingResult:
+    @property
+    def uses_shared_browser(self) -> bool:
+        """Whether this carrier's lookups can share one long-lived browser.
+
+        False for a scraper that fetches over plain HTTP instead of driving
+        Chrome (FedEx via Scrape.do), where there is no browser to reuse.
+        """
+        return True
+
+    def session(self, max_lookups: Optional[int] = None) -> "BrowserSession":
+        """A browser held open across many tracking numbers for this carrier.
+
+        Launching Chrome costs ~10-15s of the ~40s a lookup takes, and a bulk
+        run paid it once per row — 288 launches for 288 parcels. Opening once
+        and feeding numbers through it removes nearly all of that, without
+        adding any concurrency: still one page at a time.
+
+        Use it as a context manager; the browser is always torn down on exit.
+        """
+        return BrowserSession(self, max_lookups)
+
+    def _launch(self):
+        """Start one stealth browser. Returns (context_manager, live session)."""
         proxy = self.get_proxy()
         # Required for Chrome inside containers (runs as root, no /dev/shm).
         # Harmless on desktop; makes the Docker/Render deploy work.
@@ -168,51 +175,142 @@ class BaseScraper(ABC):
                 chromium_arg=chromium_arg,
             )
             sb = browser.__enter__()
+        return browser, sb
 
-        try:
-            # Open the public page in stealth mode; this clears most bot checks.
-            sb.uc_open_with_reconnect(self.build_url(tracking_number),
-                                      reconnect_time=config.RECONNECT_TIME)
+    def _fetch(self, sb, tracking_number: str) -> TrackingResult:
+        """Drive an ALREADY-OPEN browser to one result.
 
-            # If a Cloudflare/Turnstile checkbox appears, try to click it.
-            # Catch BaseException: headless servers have no display and pyautogui
-            # raises SystemExit (missing tkinter) — must not kill the scrape.
-            if config.SOLVE_CAPTCHA:
-                try:
-                    sb.uc_gui_click_captcha()
-                except BaseException:
-                    pass  # no captcha present, or GUI-click unavailable
+        No launching and no retrying here — those belong to BrowserSession, so
+        this same body serves both a one-shot lookup and the 200th number fed
+        through a reused browser.
+        """
+        # Open the public page in stealth mode; this clears most bot checks.
+        sb.uc_open_with_reconnect(self.build_url(tracking_number),
+                                  reconnect_time=config.RECONNECT_TIME)
 
-            self._check_block(sb)
-
-            api = self.api_url(tracking_number)
-            if api:
-                # Reuse the now-trusted session (cookies/fingerprint) to hit the
-                # internal JSON endpoint directly — clean data, no HTML parsing.
-                sb.uc_open_with_reconnect(api, reconnect_time=2)
-                self._check_block(sb)
-                body = sb.get_text("body")
-                try:
-                    data = json.loads(body)
-                except (ValueError, TypeError):
-                    return TrackingResult.failure(
-                        tracking_number, self.carrier,
-                        "internal API did not return JSON (verify api_url)")
-                result = self.parse_json(data, tracking_number)
-            else:
-                result = self.parse_dom(sb, tracking_number)
-
-            result.scraped_at = datetime.now(timezone.utc)
-            return result
-        finally:
-            # Always tear the browser down, including when a retry is about to
-            # relaunch one. A leaked Chrome keeps its memory, and enough of them
-            # is exactly what starves the next scrape into "invalid session id".
+        # If a Cloudflare/Turnstile checkbox appears, try to click it.
+        # Catch BaseException: headless servers have no display and pyautogui
+        # raises SystemExit (missing tkinter) — must not kill the scrape.
+        if config.SOLVE_CAPTCHA:
             try:
-                browser.__exit__(*sys.exc_info())
-            except Exception:
-                pass  # teardown of an already-dead browser must not mask the real error
+                sb.uc_gui_click_captcha()
+            except BaseException:
+                pass  # no captcha present, or GUI-click unavailable
+
+        self._check_block(sb)
+
+        api = self.api_url(tracking_number)
+        if api:
+            # Reuse the now-trusted session (cookies/fingerprint) to hit the
+            # internal JSON endpoint directly — clean data, no HTML parsing.
+            sb.uc_open_with_reconnect(api, reconnect_time=2)
+            self._check_block(sb)
+            body = sb.get_text("body")
+            try:
+                data = json.loads(body)
+            except (ValueError, TypeError):
+                return TrackingResult.failure(
+                    tracking_number, self.carrier,
+                    "internal API did not return JSON (verify api_url)")
+            result = self.parse_json(data, tracking_number)
+        else:
+            result = self.parse_dom(sb, tracking_number)
+
+        result.scraped_at = datetime.now(timezone.utc)
+        return result
+
+    def scrape(self, tracking_number: str) -> TrackingResult:
+        """Look up one number in its own browser (opened and closed here).
+
+        The single-shipment endpoint's path. Bulk runs should use session()
+        instead so one browser serves many numbers.
+        """
+        with self.session(max_lookups=1) as s:
+            return s.track(tracking_number)
 
     def polite_delay(self) -> None:
         """Random human-like pause between tracking numbers."""
         time.sleep(random.uniform(config.MIN_DELAY, config.MAX_DELAY))
+
+
+# Exceptions that mean "try again on a fresh browser" rather than "this number
+# has no data". A not-found number is RETURNED as TrackingResult.failure(), so
+# it never lands here and never burns a retry.
+TRANSIENT = (Blocked, WebDriverException, OSError)
+
+
+class BrowserSession:
+    """One Chrome, many tracking numbers.
+
+    Opening Chrome costs ~10-15s of the ~40s a lookup takes. A bulk run used to
+    pay that per row — 288 launches for 288 parcels — so a session keeps the
+    browser open and feeds numbers through it. Still strictly one page at a
+    time: this removes wasted startup, it does not add concurrency.
+
+    The browser is recycled every `max_lookups` numbers so a long run doesn't
+    ride one fingerprint forever, and it is relaunched automatically whenever it
+    dies, so one crash costs the row a retry rather than killing the run.
+    """
+
+    def __init__(self, scraper: BaseScraper, max_lookups: Optional[int] = None):
+        self.scraper = scraper
+        self.max_lookups = max_lookups or config.SESSION_MAX_LOOKUPS
+        self._browser = None
+        self._sb = None
+        self._used = 0
+        self.launches = 0   # for logging/tests: how many Chromes this cost
+
+    # -- lifecycle ---------------------------------------------------------
+    def __enter__(self) -> "BrowserSession":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self.close()
+        return False
+
+    def _ensure_browser(self) -> None:
+        """Open a browser if we don't have a usable one."""
+        if self._sb is not None and self._used < self.max_lookups:
+            return
+        self.close()  # recycle: past the reuse budget, or nothing open yet
+        self._browser, self._sb = self.scraper._launch()
+        self._used = 0
+        self.launches += 1
+
+    def close(self) -> None:
+        """Tear the browser down. Safe to call repeatedly."""
+        browser, self._browser, self._sb = self._browser, None, None
+        self._used = 0
+        if browser is None:
+            return
+        try:
+            browser.__exit__(*sys.exc_info())
+        except Exception:
+            # A browser that already died can't be closed cleanly, and saying so
+            # would mask the real error we're probably unwinding from.
+            pass
+
+    # -- work --------------------------------------------------------------
+    def track(self, tracking_number: str) -> TrackingResult:
+        """Look up one number, relaunching and retrying if the browser dies."""
+        # A carrier that doesn't drive Chrome (FedEx over Scrape.do) has no
+        # browser to share; hand straight to its own implementation.
+        if not self.scraper.uses_shared_browser:
+            return self.scraper.scrape(tracking_number)
+
+        last: BaseException | None = None
+        for attempt in range(1, config.MAX_RETRIES + 1):
+            try:
+                self._ensure_browser()
+                self._used += 1
+                return self.scraper._fetch(self._sb, tracking_number)
+            except TRANSIENT as exc:
+                last = exc
+                # Whatever went wrong, this browser is no longer trustworthy —
+                # drop it so the next attempt starts clean (and, for a block, on
+                # a fresh fingerprint/IP).
+                self.close()
+                if attempt < config.MAX_RETRIES:
+                    time.sleep(min(2 ** attempt, 30) + random.uniform(0, 1))
+        assert last is not None
+        raise last

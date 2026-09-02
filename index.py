@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Optional
+from contextlib import contextmanager
+from typing import Callable, Iterator, Optional
 
 from fastapi import (
     FastAPI,
@@ -102,19 +103,44 @@ def _validate_number(number: str) -> str:
     return number
 
 
-def scrape_one(carrier: Carrier, number: str) -> dict:
-    """Scrape a single shipment and return the JSON-ready ShipmentOut payload.
+def _payload(result: TrackingResult) -> dict:
+    """TrackingResult -> the JSON-ready ShipmentOut shape the frontend reads."""
+    return ShipmentOut(**result.model_dump(mode="json")).model_dump(mode="json")
 
-    Failures are returned as an ``ok: False`` result rather than raised, so a
-    bulk run keeps going when one carrier blocks us. Looks the scraper up in
-    SCRAPERS at call time so tests can monkeypatch it.
+
+@contextmanager
+def carrier_session(carrier: Carrier) -> Iterator[Callable[[str], dict]]:
+    """Yield a ``track(number) -> payload`` bound to ONE browser.
+
+    Opening Chrome is ~10-15s of a ~40s lookup, so a bulk run that launched one
+    per row spent most of its time starting browsers. Every number for a carrier
+    now goes through a single session. Still one page at a time — this removes
+    wasted startup rather than adding concurrency.
+
+    Raises on failure; the caller decides how to record it.
     """
     scraper = SCRAPERS[carrier]
+    opener = getattr(scraper, "session", None)
+    if opener is None:
+        # A stand-in scraper (tests) that only implements scrape(): one-shot.
+        yield lambda number: _payload(scraper.scrape(number))
+        return
+    with opener() as session:
+        yield lambda number: _payload(session.track(number))
+
+
+def scrape_one(carrier: Carrier, number: str) -> dict:
+    """Scrape a single shipment in its own browser.
+
+    Failures are returned as an ``ok: False`` result rather than raised, so the
+    endpoint always answers. Looks the scraper up in SCRAPERS at call time so
+    tests can monkeypatch it.
+    """
     try:
-        result = scraper.scrape(number)
+        with carrier_session(carrier) as track:
+            return track(number)
     except Exception as exc:  # blocked after retries, timeout, etc.
-        result = TrackingResult.failure(number, carrier, str(exc))
-    return ShipmentOut(**result.model_dump(mode="json")).model_dump(mode="json")
+        return _payload(TrackingResult.failure(number, carrier, str(exc)))
 
 
 def _xlsx_response(data: bytes, filename: str) -> Response:
@@ -198,7 +224,7 @@ def create_app() -> FastAPI:
             raise HTTPException(
                 status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(exc)
             ) from exc
-        job = batch.JOBS.create(parsed, scrape_one, concurrency=concurrency)
+        job = batch.JOBS.create(parsed, carrier_session, concurrency=concurrency)
         return BatchJobOut(**job.to_dict())
 
     @app.get("/api/batch", response_model=list[BatchJobOut])

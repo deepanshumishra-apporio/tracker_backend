@@ -228,6 +228,11 @@ class FedExScraper(BaseScraper):
     # lands on the real tracking page. Without a token, fall back to the local
     # UC Mode browser (base.scrape), optionally via a residential PROXY_URL.
     # ------------------------------------------------------------------
+    @property
+    def uses_shared_browser(self) -> bool:
+        # The Scrape.do path is a plain HTTP fetch — no browser to share.
+        return not config.SCRAPEDO_TOKEN
+
     def scrape(self, tracking_number: str) -> TrackingResult:
         if config.SCRAPEDO_TOKEN:
             return self._scrape_scrapedo(tracking_number)

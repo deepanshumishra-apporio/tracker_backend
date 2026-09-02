@@ -94,9 +94,21 @@ Upload a sheet with a **`company`** and an **`awb`** column:
 * Limits: 5 MB, 500 rows per file, `.xlsx`/`.xlsm`/`.csv` only.
 
 Scraping N rows takes minutes, so the upload only parses and queues. Rows are
-scraped by a small background pool (`?concurrency=`, default 2 — each worker
-drives its own Chrome) and the client polls the job. **Jobs live in memory only:
-restarting the API clears them.**
+grouped by carrier and each group is fed through **one reused browser**, then
+the client polls the job. **Jobs live in memory only: restarting the API clears
+them.**
+
+Tuning (all env vars):
+
+| Var | Default | What it does |
+| --- | --- | --- |
+| `BATCH_CONCURRENCY` | `1` | Carrier groups scraped in parallel. Each drives its own Chrome, so this multiplies **CPU and memory** — 1 per 2 vCPUs is a safe rule. Too high starves Chrome's renderer, which surfaces as a flood of `invalid session id`. |
+| `SESSION_MAX_LOOKUPS` | `25` | Numbers one browser handles before it is recycled for a fresh fingerprint. |
+| `MIN_DELAY` / `MAX_DELAY` | `5` / `20` | Pause between lookups. Lowering raises ban risk. |
+
+Chrome startup is ~10-15s of a ~40s lookup, so reuse is where the time is: a
+172-row file drops from 172 launches to 10 — roughly 35 minutes off a 2-hour
+run, with no extra load.
 
 ```bash
 curl -F file=@shipments.xlsx http://127.0.0.1:8000/api/batch      # -> {"id": "...", ...}

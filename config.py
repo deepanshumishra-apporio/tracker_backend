@@ -81,6 +81,12 @@ def scrapedo_proxy() -> Optional[str]:
 # id" rows. Raise it only on a box with RAM to spare.
 BATCH_CONCURRENCY = max(1, int(os.getenv("BATCH_CONCURRENCY", "1")))
 
+# How many tracking numbers one browser handles before it is recycled. Reusing
+# a browser is the whole speed win (Chrome startup is ~10-15s of a ~40s lookup),
+# but riding one fingerprint for hundreds of lookups is exactly what anti-bot
+# systems watch for — so trade a launch every N numbers for a fresh identity.
+SESSION_MAX_LOOKUPS = max(1, int(os.getenv("SESSION_MAX_LOOKUPS", "25")))
+
 MIN_DELAY = float(os.getenv("MIN_DELAY", "5"))
 MAX_DELAY = float(os.getenv("MAX_DELAY", "20"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
