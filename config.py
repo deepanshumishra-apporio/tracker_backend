@@ -22,10 +22,52 @@ load_dotenv()
 USE_PROXIES = os.getenv("USE_PROXIES", "false").lower() == "true"
 PROXY_URL = os.getenv("PROXY_URL", "")
 
+# Loud warning: USE_PROXIES=true but no PROXY_URL means we'd silently scrape
+# proxy-less from a datacenter IP and get blocked by every carrier — the exact
+# failure this setting is meant to prevent. Surface it in the deploy logs.
+if USE_PROXIES and not PROXY_URL:
+    import warnings
+    warnings.warn(
+        "USE_PROXIES=true but PROXY_URL is empty — falling back to NO proxy. "
+        "Set PROXY_URL (e.g. in the Render dashboard) or scrapes will be blocked.",
+        stacklevel=2,
+    )
+
 
 def proxy_or_none() -> Optional[str]:
     """What to hand SeleniumBase's proxy= argument."""
     return PROXY_URL if (USE_PROXIES and PROXY_URL) else None
+
+
+# ---------------------------------------------------------------------------
+# SCRAPE.DO  (residential proxy + JS rendering via API — used for FedEx)
+# ---------------------------------------------------------------------------
+# FedEx is behind Akamai and blocks datacenter IPs. When SCRAPEDO_TOKEN is set,
+# the FedEx scraper fetches the rendered page through Scrape.do (residential IP +
+# headless render) instead of driving a local browser. Get the token from your
+# Scrape.do dashboard. Leave empty to use the SeleniumBase browser path instead.
+SCRAPEDO_TOKEN = os.getenv("SCRAPEDO_TOKEN", "")
+# Country to route through (Scrape.do geoCode). FedEx is US-facing → "us".
+SCRAPEDO_GEO = os.getenv("SCRAPEDO_GEO", "us")
+
+
+# Local gost forwarder (started by entrypoint.sh) that injects Scrape.do's
+# proxy auth for Chrome. Chrome talks to this; gost forwards to proxy.scrape.do.
+SCRAPEDO_FORWARDER = os.getenv("SCRAPEDO_FORWARDER", "127.0.0.1:8899")
+
+
+def scrapedo_proxy() -> Optional[str]:
+    """Address Chrome uses for Scrape.do proxy mode: the LOCAL gost forwarder.
+
+    Used for Akamai-protected carriers (FedEx): the real UC Mode Chrome renders
+    the page (so Akamai's bot sensor sees a real browser) while Scrape.do supplies
+    a residential exit IP — proven to load the real FedEx page where Scrape.do's
+    render API (a detectable headless browser) gets bounced to system-error.
+
+    Chrome can't auth to Scrape.do directly (the "super=true" password), so it
+    talks to gost on 127.0.0.1:8899, which injects the credentials upstream.
+    """
+    return SCRAPEDO_FORWARDER if SCRAPEDO_TOKEN else None
 
 
 # ---------------------------------------------------------------------------

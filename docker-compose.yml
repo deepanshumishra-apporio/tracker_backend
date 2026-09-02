@@ -1,0 +1,22 @@
+# Single-container tracker: Python code + Google Chrome + Xvfb in one image.
+# SeleniumBase launches Chrome in-process, so NO separate browser container.
+#
+#   docker compose up --build
+#
+# Runtime config (proxy, CORS, delays) comes from deploy/tracker.env — copy
+# deploy/tracker.env.example to deploy/tracker.env and fill in a REAL residential
+# PROXY_URL before deploying (a datacenter IP gets blocked, FedEx especially).
+services:
+  backend:
+    build: .
+    image: tracker-backend
+    ports:
+      - "8000:8000"
+    env_file:
+      # Optional: copy deploy/tracker.env.example to deploy/tracker.env and set a
+      # REAL residential PROXY_URL. Absent = image defaults (no proxy → blocks).
+      - path: deploy/tracker.env
+        required: false
+    # Chrome needs more shared memory than the 64MB Docker default, or tabs crash.
+    shm_size: "2gb"
+    restart: unless-stopped

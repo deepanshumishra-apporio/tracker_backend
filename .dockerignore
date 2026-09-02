@@ -1,14 +1,25 @@
+# Keep the image small and secrets out of it.
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
 venv/
-*.db
+*.egg-info/
+
+# Secrets / local env — passed at runtime via --env-file, never baked in.
 .env
+deploy/tracker.env
+
+# SeleniumBase runtime artifacts
 downloaded_files/
 latest_logs/
 *.lock
+
+# Local data / misc
+*.db
 *.log
 .git/
 .gitignore
+.DS_Store
+Thumbs.db
 tests/

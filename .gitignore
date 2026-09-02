@@ -11,6 +11,7 @@ venv/
 
 # Secrets / local env
 .env
+deploy/tracker.env
 
 # SeleniumBase runtime artifacts (auto-downloaded)
 downloaded_files/

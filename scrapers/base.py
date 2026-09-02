@@ -61,6 +61,11 @@ class BaseScraper(ABC):
     def parse_dom(self, sb, tracking_number: str) -> TrackingResult:
         raise NotImplementedError
 
+    def get_proxy(self) -> Optional[str]:
+        """Proxy to route this scraper's browser through. Subclasses override
+        (e.g. FedEx uses Scrape.do proxy mode for a residential IP)."""
+        return config.proxy_or_none()
+
     # ---- shared machinery ------------------------------------------------
     def _check_block(self, sb) -> None:
         title = (sb.get_title() or "").lower()
@@ -79,6 +84,16 @@ class BaseScraper(ABC):
         reraise=True,
     )
     def scrape(self, tracking_number: str) -> TrackingResult:
+        proxy = self.get_proxy()
+        # Required for Chrome inside containers (runs as root, no /dev/shm).
+        # Harmless on desktop; makes the Docker/Render deploy work.
+        chromium_arg = "--no-sandbox,--disable-dev-shm-usage"
+        # Scrape.do proxy mode intercepts HTTPS with its own cert, so the browser
+        # must not reject it. Only added when routing through Scrape.do (directly
+        # or via the local gost forwarder).
+        if proxy and ("scrape.do" in proxy or proxy == config.SCRAPEDO_FORWARDER):
+            chromium_arg += ",--ignore-certificate-errors"
+
         with SB(
             uc=True,
             headless=config.HEADLESS,
@@ -86,12 +101,10 @@ class BaseScraper(ABC):
             # of headless — UC Mode is far harder to detect this way (needed for
             # Akamai-protected FedEx). Ignored on Windows/macOS.
             xvfb=config.USE_XVFB,
-            proxy=config.proxy_or_none(),
+            proxy=proxy,
             locale_code="en",
             ad_block=True,
-            # Required for Chrome inside containers (runs as root, no /dev/shm).
-            # Harmless on desktop; makes the Docker/Render deploy work.
-            chromium_arg="--no-sandbox,--disable-dev-shm-usage",
+            chromium_arg=chromium_arg,
         ) as sb:
             # Open the public page in stealth mode; this clears most bot checks.
             sb.uc_open_with_reconnect(self.build_url(tracking_number),

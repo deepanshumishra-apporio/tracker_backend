@@ -1,0 +1,28 @@
+[Unit]
+# Multi-carrier tracker backend (FastAPI + SeleniumBase UC Mode).
+Description=Tracker backend (FastAPI + SeleniumBase UC Mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User and paths to match the VM. On Azure Ubuntu the default admin user
+# is usually "azureuser"; the repo is assumed cloned at /home/azureuser/tracker.
+User=azureuser
+WorkingDirectory=/home/azureuser/tracker/backend
+
+# Runtime config (HOST/PORT/proxies/CORS/…). Copy deploy/tracker.env.example to
+# deploy/tracker.env, edit it, then: sudo cp deploy/tracker.env /etc/tracker.env
+EnvironmentFile=/etc/tracker.env
+
+# Run via the venv's Python; index.py binds HOST:PORT from the env file.
+ExecStart=/home/azureuser/tracker/backend/.venv/bin/python index.py
+
+Restart=on-failure
+RestartSec=5
+# A crashed/hung Chrome shouldn't wedge the unit forever.
+TimeoutStopSec=30
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

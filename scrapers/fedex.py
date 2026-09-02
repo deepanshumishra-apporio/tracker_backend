@@ -11,9 +11,10 @@ FROM/TO + scan history have no stable ids, so we parse the ordered page text:
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
+import config
 from models import Carrier, Status, TrackingEvent, TrackingResult
 from scrapers.base import BaseScraper
 
@@ -219,6 +220,44 @@ class FedExScraper(BaseScraper):
     def api_url(self, tracking_number: str) -> Optional[str]:
         return None  # POST-based internal API; DOM parsing is reliable
 
+    # ------------------------------------------------------------------
+    # FedEx is Akamai-protected and blocks datacenter IPs. When a Scrape.do
+    # token is set we fetch the page through Scrape.do's render API (residential
+    # IP + JS render). Akamai only lets a render through ~1/3 of the time (else
+    # it redirects to /system-error), so scrapedo.fetch() retries until one
+    # lands on the real tracking page. Without a token, fall back to the local
+    # UC Mode browser (base.scrape), optionally via a residential PROXY_URL.
+    # ------------------------------------------------------------------
+    def scrape(self, tracking_number: str) -> TrackingResult:
+        if config.SCRAPEDO_TOKEN:
+            return self._scrape_scrapedo(tracking_number)
+        return super().scrape(tracking_number)
+
+    def _scrape_scrapedo(self, tracking_number: str) -> TrackingResult:
+        from scrapers import scrapedo
+
+        url = self.build_url(tracking_number)
+        # Plain render only — the interactive playWithBrowser "View more details"
+        # click makes Akamai block almost every time, whereas a plain render
+        # clears it ~1/3 of the time. The summary page still has status, from/to,
+        # ETA and the latest scan; scrapedo.fetch() retries until one passes.
+        html = scrapedo.fetch(url)
+        lines = scrapedo.text_lines(html)
+        status_msg = scrapedo.select_text(html, "#statCode")
+        est_text = scrapedo.select_text(html, "[data-test-id=delivery-date-text]")
+
+        result = self._build_result(
+            tracking_number, lines, lines, status_msg, est_text)
+        result.scraped_at = datetime.now(timezone.utc)
+        return result
+
+    def get_proxy(self):
+        # Browser-path proxy (used only when no Scrape.do token): a real
+        # residential proxy if configured.
+        if config.USE_PROXIES and config.PROXY_URL:
+            return config.PROXY_URL
+        return super().get_proxy()
+
     def parse_dom(self, sb, tracking_number: str) -> TrackingResult:
         # Wait for async tracking data. Delivered shipments use a different layout
         # (no #statCode / no "ESTIMATED DELIVERY"), so accept several signals.
@@ -246,11 +285,39 @@ class FedExScraper(BaseScraper):
             return TrackingResult.failure(tracking_number, self.carrier,
                                           f"could not read page: {e}")
         summary_lines = [ln.strip() for ln in summary.split("\n") if ln.strip()]
+
+        # Now expand the full scan history ("View more details" -> "Travel history").
+        try:
+            sb.execute_script(
+                "for(const el of document.querySelectorAll('button,a,span')){"
+                "if(((el.textContent||'').trim().toLowerCase()).startsWith('view more details'))"
+                "{el.click();return;}}")
+            sb.sleep(3)
+        except Exception:
+            pass
+        try:
+            hist_body = sb.get_text("body")
+        except Exception:
+            hist_body = summary
+        hist_lines = [ln.strip() for ln in hist_body.split("\n") if ln.strip()]
+
+        return self._build_result(
+            tracking_number, summary_lines, hist_lines, status_msg, est_text)
+
+    # ------------------------------------------------------------------
+    # Pure parser: turn already-collected page text into a TrackingResult.
+    # Source-agnostic — fed by either the browser or Scrape.do path above.
+    #   summary_lines : page text BEFORE expanding (has FROM/TO, latest scan)
+    #   hist_lines    : page text AFTER  expanding (has Travel history + facts)
+    # ------------------------------------------------------------------
+    def _build_result(self, tracking_number: str, summary_lines: list[str],
+                      hist_lines: list[str], status_msg: Optional[str],
+                      est_text: Optional[str]) -> TrackingResult:
         summary_upper = [ln.upper() for ln in summary_lines]
 
         # FedEx purges tracking numbers a while after delivery — distinguish
         # "not found" from a page/parse problem so it's not mistaken for a bug.
-        low = summary.lower()
+        low = "\n".join(summary_lines).lower()
         if "can't find that tracking number" in low or "check with the shipper" in low:
             return TrackingResult.failure(
                 tracking_number, self.carrier,
@@ -297,22 +364,6 @@ class FedExScraper(BaseScraper):
         if not has_signal:
             return TrackingResult.failure(tracking_number, self.carrier,
                                           "no tracking data (invalid number or page changed)")
-
-        # Now expand the full scan history ("View more details" -> "Travel history").
-        try:
-            sb.execute_script(
-                "for(const el of document.querySelectorAll('button,a,span')){"
-                "if(((el.textContent||'').trim().toLowerCase()).startsWith('view more details'))"
-                "{el.click();return;}}")
-            sb.sleep(3)
-        except Exception:
-            pass
-
-        try:
-            hist_body = sb.get_text("body")
-        except Exception:
-            hist_body = summary
-        hist_lines = [ln.strip() for ln in hist_body.split("\n") if ln.strip()]
 
         # Most-recent scan (from the summary view): first date+time; location above it.
         scan_dt = scan_loc = None

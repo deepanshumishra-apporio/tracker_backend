@@ -1,32 +1,57 @@
-# Backend image: Python + Google Chrome (SeleniumBase UC Mode needs a real Chrome).
+# Multi-carrier tracker backend — single container.
+#
+# SeleniumBase UC Mode launches a REAL Google Chrome *inside this container*
+# (not a remote browser container). To beat Akamai/DataDome/Cloudflare the
+# browser runs HEADED inside a virtual display (Xvfb) — so both Chrome and Xvfb
+# must live here alongside the Python code.
+#
+# Build:  docker build -t tracker-backend .
+# Run:    docker run --rm -p 8000:8000 --env-file deploy/tracker.env tracker-backend
 FROM python:3.12-slim
 
-# System deps + Google Chrome stable (apt resolves Chrome's own libs).
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+# --- System deps: Google Chrome + Xvfb + fonts (mirrors deploy/setup.sh) ------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        wget gnupg ca-certificates fonts-liberation xvfb xauth python3-tk \
-    && wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+        wget gnupg ca-certificates fonts-liberation \
+        xvfb xauth python3-tk \
+    && wget -q -O /tmp/chrome.deb \
+        https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
     && apt-get install -y --no-install-recommends /tmp/chrome.deb \
     && rm -f /tmp/chrome.deb \
     && rm -rf /var/lib/apt/lists/*
 
+# --- gost: local proxy forwarder that injects Scrape.do's residential proxy ---
+# auth for Chrome (which can't send the "super=true" proxy password itself).
+RUN wget -q -O /tmp/gost.gz \
+        https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz \
+    && gunzip /tmp/gost.gz \
+    && mv /tmp/gost /usr/local/bin/gost \
+    && chmod +x /usr/local/bin/gost
+
 WORKDIR /app
 
+# Install Python deps first for better layer caching.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip && pip install -r requirements.txt
 
+# App source.
 COPY . .
-# Normalize line endings (Windows checkouts may be CRLF) and make executable.
-RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
-# Run headed inside a virtual display — UC Mode is far harder for anti-bot to
-# detect than headless (needed for Akamai-protected FedEx). The whole process is
-# wrapped in `xvfb-run`, which provides a real $DISPLAY for headed Chrome.
-# SOLVE_CAPTCHA off: GUI captcha-clicking needs pyautogui/tkinter; UC Mode's
-# reconnect handles most Cloudflare challenges on its own.
-ENV HEADLESS=false \
-    USE_XVFB=false \
-    SOLVE_CAPTCHA=false \
-    PYTHONUNBUFFERED=1
+# Chrome inside a container must run headed-in-Xvfb, never real headless.
+# base.py already passes --no-sandbox / --disable-dev-shm-usage.
+ENV HOST=0.0.0.0 \
+    PORT=8000 \
+    HEADLESS=false \
+    USE_XVFB=true \
+    SOLVE_CAPTCHA=false
 
-# entrypoint.sh starts Xvfb, exports $DISPLAY, then runs the app (binds 0.0.0.0:$PORT).
+EXPOSE 8000
+
+# entrypoint.sh starts the gost forwarder (if using Scrape.do proxy mode),
+# then launches index.py (FastAPI).
+RUN chmod +x /app/entrypoint.sh
 CMD ["/app/entrypoint.sh"]
