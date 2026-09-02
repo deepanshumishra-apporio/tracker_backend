@@ -214,3 +214,70 @@ def test_the_extractor_no_longer_deletes_dom_nodes():
     """Removing every <i> in the subtree is what erased the headline."""
     assert "querySelectorAll(ICONS)" not in _EXTRACT_JS
     assert "LIGATURE" in _EXTRACT_JS
+
+
+# ---------------------------------------------------------------------------
+# UPS throttling — the page renders, but the lookup is refused.
+# ---------------------------------------------------------------------------
+from scrapers.ups import _refused, _THROTTLED  # noqa: E402
+
+# Verbatim from the live page while UPS was rate-limiting the server's IP.
+_REFUSAL_BODY = """Track a Package
+warning
+Tracking Error
+Toggle Message Content
+We are unable to complete your tracking request at this time. Please try again later.
+Tracking Number
+                                 Invalid
+Please provide a tracking number.
+0 of 25 tracking numbers entered."""
+
+
+class _Body:
+    def __init__(self, text):
+        self.text = text
+
+    def get_text(self, _sel):
+        return self.text
+
+
+def test_recognizes_the_throttle_page():
+    assert _refused(_Body(_REFUSAL_BODY)) is True
+
+
+def test_a_real_shipment_page_is_not_mistaken_for_a_throttle():
+    assert _refused(_Body("Delivered\nWATERLOO, CA\nParcel History")) is False
+
+
+def test_refusal_check_survives_a_dead_browser():
+    class _Dead:
+        def get_text(self, _sel):
+            raise RuntimeError("invalid session id")
+
+    assert _refused(_Dead()) is False
+
+
+def test_throttle_message_blames_the_ip_not_the_number():
+    """The old wording sent us hunting for a parser bug that didn't exist."""
+    assert "rate-limiting this IP" in _THROTTLED
+    assert "proxy" in _THROTTLED.lower()
+    assert "invalid number" not in _THROTTLED.lower()
+
+
+def test_throttled_lookup_reports_the_real_cause():
+    class _Throttled(_FakeSB):
+        def __init__(self):
+            super().__init__({})
+
+        def execute_script(self, script):
+            if "stApp_nameKey" in script:
+                return False   # the headline never appears
+            return None
+
+        def get_text(self, _sel):
+            return _REFUSAL_BODY
+
+    result = UPSScraper().parse_dom(_Throttled(), "1ZH40B480424822345")
+    assert result.ok is False
+    assert "rate-limiting this IP" in result.error
+    assert "no status found" not in result.error

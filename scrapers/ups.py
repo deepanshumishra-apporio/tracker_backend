@@ -148,6 +148,30 @@ return JSON.stringify(out);
 """.replace("%MILESTONES%", json.dumps(_MILESTONES))
 
 
+# What UPS says when it is refusing lookups from this IP rather than reporting
+# on the parcel. Matched against the rendered body, not the HTML source: the
+# page is an SPA, so the message only exists after render.
+_REFUSAL_MARKERS = (
+    "unable to complete your tracking request",
+    "0 of 25 tracking numbers entered",
+)
+
+_THROTTLED = (
+    "UPS refused the lookup — it is rate-limiting this IP, not rejecting the "
+    "number. A residential proxy (USE_PROXIES/PROXY_URL) is the fix; retrying "
+    "from the same IP will not help."
+)
+
+
+def _refused(sb) -> bool:
+    """True when the page is UPS's throttle response instead of a shipment."""
+    try:
+        body = (sb.get_text("body") or "").lower()
+    except Exception:
+        return False
+    return any(m in body for m in _REFUSAL_MARKERS)
+
+
 def _normalize(text: str) -> Status:
     t = (text or "").lower()
     for key, status in _STATUS_MAP.items():
@@ -248,10 +272,22 @@ class UPSScraper(BaseScraper):
 
     def parse_dom(self, sb, tracking_number: str) -> TrackingResult:
         # UPS loads data async — poll until the status headline appears.
+        appeared = False
         for _ in range(15):
             sb.sleep(2)
             if sb.execute_script("return !!document.querySelector('#stApp_nameKey')"):
+                appeared = True
                 break
+
+        if not appeared:
+            # UPS still renders its tracking page when it is throttling the
+            # caller's IP — it just refuses the lookup ("0 of 25 tracking
+            # numbers entered"). Say so, rather than blaming the number: the
+            # old "no status found" wording pointed at the tracking number or
+            # our parser and cost real time chasing a bug that wasn't there.
+            if _refused(sb):
+                return TrackingResult.failure(
+                    tracking_number, self.carrier, _THROTTLED)
 
         try:
             data = json.loads(sb.execute_script(_EXTRACT_JS) or "{}")
