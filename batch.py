@@ -32,7 +32,9 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+import config
 from models import Carrier, Status, TrackingResult
+from scrapers.base import humanize_error
 
 # ---------------------------------------------------------------------------
 # Limits — a spreadsheet is user input, so cap what we will accept.
@@ -42,8 +44,8 @@ MAX_ROWS = 500                       # rows tracked per upload
 MAX_JOBS = 50                        # jobs retained in memory (oldest evicted)
 
 # How many rows are scraped at once. Each worker drives its own Chrome, so this
-# is deliberately small; raise it only on a machine with headroom.
-DEFAULT_CONCURRENCY = 2
+# multiplies memory; config caps it and BATCH_CONCURRENCY tunes it per deploy.
+DEFAULT_CONCURRENCY = config.BATCH_CONCURRENCY
 
 _TRACKING_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
 
@@ -138,6 +140,10 @@ class ParsedRow:
     awb: str
     carrier: Optional[Carrier] = None
     error: Optional[str] = None
+    # A repeat of an earlier (carrier, awb). Tracked separately from `error`
+    # because a duplicate is not something the user needs to fix — real files
+    # legitimately repeat a waybill across order lines.
+    duplicate: bool = False
 
     @property
     def valid(self) -> bool:
@@ -268,7 +274,9 @@ def parse_workbook(filename: str, data: bytes) -> ParsedFile:
         else:
             key = (carrier.value, awb.upper())
             if key in seen:
-                row.error = "Duplicate of an earlier row — skipped."
+                row.error = "Duplicate of an earlier row — tracked once."
+                row.duplicate = True
+                row.carrier = carrier
             else:
                 seen.add(key)
                 row.carrier = carrier
@@ -338,10 +346,10 @@ class BatchJob:
     # -- progress ----------------------------------------------------------
     def counts(self) -> dict[str, int]:
         c = {"total": len(self.rows), "queued": 0, "running": 0,
-             "done": 0, "failed": 0, "skipped": 0}
+             "done": 0, "failed": 0, "skipped": 0, "duplicate": 0}
         for row in self.rows:
             c[row.state] = c.get(row.state, 0) + 1
-        c["finished"] = c["done"] + c["failed"] + c["skipped"]
+        c["finished"] = c["done"] + c["failed"] + c["skipped"] + c["duplicate"]
         c["delivered"] = sum(
             1 for r in self.rows if (r.result or {}).get("status") == Status.DELIVERED.value
         )
@@ -439,7 +447,7 @@ class JobRegistry:
                 company=p.company,
                 awb=p.awb,
                 carrier=p.carrier.value if p.carrier else None,
-                state="skipped" if not p.valid else "queued",
+                state=("duplicate" if p.duplicate else "skipped" if not p.valid else "queued"),
                 error=p.error,
             )
             for i, p in enumerate(parsed.rows)
@@ -452,6 +460,12 @@ class JobRegistry:
         invalid = sum(1 for r in rows if r.state == "skipped")
         if invalid:
             notes.append(f"{invalid} row(s) couldn't be tracked — see the errors below.")
+        repeats = sum(1 for r in rows if r.state == "duplicate")
+        if repeats:
+            notes.append(
+                f"{repeats} row(s) repeat an AWB listed earlier — each shipment is "
+                "tracked once."
+            )
 
         job = BatchJob(
             id=uuid.uuid4().hex[:12],
@@ -522,7 +536,9 @@ def _run_row(
             row.error = result.get("error") or "The carrier returned no data."
     except Exception as exc:  # blocked, timeout, browser crash…
         row.state = "failed"
-        row.error = str(exc) or exc.__class__.__name__
+        # Selenium's raw message is a multi-kilobyte hex stack trace; the table
+        # needs one readable line.
+        row.error = humanize_error(exc)
         row.result = TrackingResult.failure(
             row.awb, Carrier(row.carrier), row.error
         ).model_dump(mode="json")

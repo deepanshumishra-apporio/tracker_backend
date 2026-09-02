@@ -86,3 +86,89 @@ def test_parses_full_parcel_history():
 
 def test_history_empty_without_rows():
     assert _parse_ups_history(["Shipment Details", "Service", "UPS Worldwide"]) == []
+
+
+# ---------------------------------------------------------------------------
+# Status derivation — regression tests for the bulk run of 2026-09.
+# ---------------------------------------------------------------------------
+import json  # noqa: E402
+
+import pytest  # noqa: E402
+
+from models import Carrier  # noqa: E402
+from scrapers.ups import UPSScraper, _EXTRACT_JS  # noqa: E402
+
+
+class _FakeSB:
+    """Returns a canned payload for the extract script; no browser."""
+
+    def __init__(self, payload: dict):
+        self.payload = payload
+
+    def execute_script(self, script: str):
+        # The extract script returns JSON; the later "Show Details" click script
+        # returns nothing. Distinguish by looking for the extractor's marker.
+        if "stApp_nameKey" in script:
+            return json.dumps(self.payload)
+        return None
+
+    def sleep(self, _seconds):
+        pass
+
+    def get_text(self, _selector):
+        return ""
+
+
+def _scrape(payload: dict):
+    return UPSScraper().parse_dom(_FakeSB(payload), "1ZH40B480439305840")
+
+
+def test_headline_status_is_used_when_it_maps():
+    result = _scrape({"status": "Delivered", "steps": [], "last_location": None})
+    assert result.status is Status.DELIVERED
+    assert result.ok is True
+
+
+def test_unmappable_headline_falls_back_to_the_newest_event():
+    """Row 20 of the production run: headline Unknown, history said Delivered."""
+    result = _scrape({
+        "status": "Your parcel update",          # maps to nothing
+        "last_location": None,
+        "steps": [{"label": "Delivered", "state": "completed"}],
+    })
+    assert result.status is Status.DELIVERED
+
+
+def test_fallback_prefers_a_known_status_over_unknown_events():
+    result = _scrape({
+        "status": "Your parcel update",
+        "last_location": None,
+        "steps": [
+            {"label": "Some unmapped label", "state": "completed"},
+            {"label": "On the Way", "state": "active"},
+        ],
+    })
+    assert result.status is Status.IN_TRANSIT
+
+
+def test_status_stays_unknown_when_nothing_maps():
+    result = _scrape({
+        "status": "Your parcel update",
+        "last_location": None,
+        "steps": [{"label": "Some unmapped label", "state": "completed"}],
+    })
+    assert result.status is Status.UNKNOWN
+
+
+def test_missing_headline_is_still_a_failure():
+    result = _scrape({"status": None, "steps": [], "last_location": None})
+    assert result.ok is False
+    assert "no status found" in result.error
+
+
+def test_extract_script_strips_icon_ligature_text():
+    """UPS renders 'check_circle' as icon TEXT; it leaked into the status."""
+    assert "cloneNode" in _EXTRACT_JS
+    assert "material-icons" in _EXTRACT_JS
+    # The icon nodes must be removed before textContent is read.
+    assert _EXTRACT_JS.index("querySelectorAll(ICONS)") < _EXTRACT_JS.index("c.textContent")

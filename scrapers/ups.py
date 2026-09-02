@@ -92,7 +92,16 @@ _MILESTONES = ["Label Created", "We Have Your Package", "On the Way",
 
 # Pull status / estimated delivery / last location / milestones in one shot.
 _EXTRACT_JS = r"""
-const txt = (e) => e ? e.textContent.replace(/\s+/g,' ').trim() : null;
+// Icon fonts render their glyph from the element's TEXT ("check_circle"), so a
+// naive textContent picks it up and we end up with "Delivered check_circle".
+// Strip icon nodes from a clone before reading.
+const ICONS = 'i,svg,[class*="material-icons"],[class*="material-symbols"],[class*="ups-icon"]';
+const txt = (e) => {
+  if (!e) return null;
+  const c = e.cloneNode(true);
+  c.querySelectorAll(ICONS).forEach(n => n.remove());
+  return c.textContent.replace(/\s+/g,' ').trim() || null;
+};
 let out = {};
 
 out.status = txt(document.querySelector('#stApp_nameKey'));
@@ -289,6 +298,15 @@ class UPSScraper(BaseScraper):
         elif not events:
             # Never leave a valid result event-less: record the headline status.
             events.append(TrackingEvent(description=data["status"], status=status))
+
+        # The headline occasionally renders as something we can't map (a promo
+        # banner, a wording change), leaving UNKNOWN while the parcel history we
+        # just parsed plainly says "Delivered". Trust the freshest scan in that
+        # case rather than reporting Unknown over data we already hold.
+        if status == Status.UNKNOWN:
+            newest = next((e.status for e in events if e.status != Status.UNKNOWN), None)
+            if newest is not None:
+                status = newest
 
         # Freshest scan drives delivered_at (history is newest-first).
         latest_dt = events[0].timestamp if events and events[0].timestamp else loc_dt

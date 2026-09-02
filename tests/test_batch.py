@@ -381,3 +381,36 @@ def test_export_of_a_failed_row_carries_the_error(client: TestClient, monkeypatc
     # No carrier status is claimed for a row we never actually read.
     assert ws.cell(row=2, column=5).value == "—"
     assert "wall" in ws.cell(row=2, column=ws.max_column).value
+
+
+def test_duplicates_are_their_own_state_not_a_problem(client: TestClient, monkeypatch):
+    """A repeated AWB is informational — real files repeat a waybill per line."""
+    dhl = _FakeScraper(Carrier.DHL)
+    monkeypatch.setitem(index.SCRAPERS, Carrier.DHL, dhl)
+
+    job = upload(
+        client,
+        make_xlsx([["DHL", "111"], ["DHL", "111"], ["Blue Dart", "999"]]),
+    ).json()
+    done = wait_for(client, job["id"])
+
+    by_awb = {(r["awb"], r["state"]) for r in done["rows"]}
+    assert ("111", "done") in by_awb
+    assert ("111", "duplicate") in by_awb
+    assert ("999", "skipped") in by_awb
+
+    # Tracked once, and the duplicate is counted apart from real problems.
+    assert dhl.calls == ["111"]
+    assert done["counts"]["duplicate"] == 1
+    assert done["counts"]["skipped"] == 1
+    assert done["counts"]["finished"] == 3
+    assert any("repeat an AWB" in n for n in done["notes"])
+
+
+def test_a_duplicate_row_keeps_its_carrier_for_the_ui(client: TestClient, monkeypatch):
+    monkeypatch.setitem(index.SCRAPERS, Carrier.DHL, _FakeScraper(Carrier.DHL))
+    job = upload(client, make_xlsx([["DHL", "111"], ["DHL Express", "111"]])).json()
+    done = wait_for(client, job["id"])
+
+    dup = next(r for r in done["rows"] if r["state"] == "duplicate")
+    assert dup["carrier"] == "dhl", "the badge should still show which carrier it was"

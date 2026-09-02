@@ -74,6 +74,13 @@ def scrapedo_proxy() -> Optional[str]:
 # RATE LIMITING — human-like, randomized delays (seconds) between requests.
 # Slower = less likely to get banned. Do not lower these carelessly.
 # ---------------------------------------------------------------------------
+# How many spreadsheet rows a bulk run scrapes at once. Each one drives its own
+# real Chrome (~0.5-1 GB with a heavy carrier page), so this multiplies memory,
+# not just CPU. Default 1: a 2 GB VM cannot hold two, and when it OOMs the
+# kernel kills Chrome mid-scrape — which surfaces as a flood of "invalid session
+# id" rows. Raise it only on a box with RAM to spare.
+BATCH_CONCURRENCY = max(1, int(os.getenv("BATCH_CONCURRENCY", "1")))
+
 MIN_DELAY = float(os.getenv("MIN_DELAY", "5"))
 MAX_DELAY = float(os.getenv("MAX_DELAY", "20"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
