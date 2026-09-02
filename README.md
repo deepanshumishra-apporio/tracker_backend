@@ -126,6 +126,7 @@ VM (not a serverless host). Everything lives in `deploy/`:
 | File                        | Purpose                                             |
 | --------------------------- | --------------------------------------------------- |
 | `deploy/setup.sh`           | One-time provisioning: Chrome + Xvfb + Python venv. |
+| `deploy/update.sh`          | Redeploy: pull + deps + verify + restart, with rollback. |
 | `deploy/tracker.env.example`| systemd env template (bind, display, **proxy**, CORS). |
 | `deploy/tracker.service`    | systemd unit — auto-start + auto-restart.           |
 
@@ -151,7 +152,20 @@ journalctl -u tracker -f                    # live logs
 #    or put Nginx/Caddy in front for TLS on 443.
 ```
 
-Redeploy after a code change: `git pull && sudo systemctl restart tracker`.
+**Redeploy after a code change:**
+
+```bash
+cd ~/tracker/backend && bash deploy/update.sh
+```
+
+`deploy/update.sh` pulls, installs `requirements.txt` into the venv, verifies
+the app still imports, restarts the service, and waits for `/api/health` —
+rolling back to the previous commit if either check fails.
+
+> Do **not** just `git pull && systemctl restart`. A release that adds a Python
+> dependency (the bulk-upload feature added `openpyxl` and `python-multipart`)
+> will import-crash on restart and take the whole API down, not just the new
+> endpoints.
 
 **Notes:**
 - The VM runs Chrome **headed inside Xvfb** (`HEADLESS=false`, `USE_XVFB=true`) —
