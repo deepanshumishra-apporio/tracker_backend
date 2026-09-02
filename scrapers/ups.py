@@ -94,13 +94,20 @@ _MILESTONES = ["Label Created", "We Have Your Package", "On the Way",
 _EXTRACT_JS = r"""
 // Icon fonts render their glyph from the element's TEXT ("check_circle"), so a
 // naive textContent picks it up and we end up with "Delivered check_circle".
-// Strip icon nodes from a clone before reading.
-const ICONS = 'i,svg,[class*="material-icons"],[class*="material-symbols"],[class*="ups-icon"]';
+//
+// Drop those tokens from the STRING rather than removing icon nodes from the
+// DOM: an earlier version deleted every <i> in the subtree, and where UPS wraps
+// the headline in one that erased the status itself, turning every UPS row into
+// "no status found". Filtering snake_case words is purely subtractive — real
+// status text ("Delivered", "On the Way", "Label Created") never looks like
+// that — and the original string is kept if filtering would empty it.
+const LIGATURE = /^[a-z][a-z0-9]*(_[a-z0-9]+)+$/;
 const txt = (e) => {
   if (!e) return null;
-  const c = e.cloneNode(true);
-  c.querySelectorAll(ICONS).forEach(n => n.remove());
-  return c.textContent.replace(/\s+/g,' ').trim() || null;
+  const raw = e.textContent.replace(/\s+/g,' ').trim();
+  if (!raw) return null;
+  const kept = raw.split(' ').filter(w => !LIGATURE.test(w)).join(' ').trim();
+  return kept || raw;
 };
 let out = {};
 

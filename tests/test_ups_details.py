@@ -92,6 +92,7 @@ def test_history_empty_without_rows():
 # Status derivation — regression tests for the bulk run of 2026-09.
 # ---------------------------------------------------------------------------
 import json  # noqa: E402
+import re  # noqa: E402
 
 import pytest  # noqa: E402
 
@@ -166,9 +167,50 @@ def test_missing_headline_is_still_a_failure():
     assert "no status found" in result.error
 
 
-def test_extract_script_strips_icon_ligature_text():
-    """UPS renders 'check_circle' as icon TEXT; it leaked into the status."""
-    assert "cloneNode" in _EXTRACT_JS
-    assert "material-icons" in _EXTRACT_JS
-    # The icon nodes must be removed before textContent is read.
-    assert _EXTRACT_JS.index("querySelectorAll(ICONS)") < _EXTRACT_JS.index("c.textContent")
+# The extract script runs in the browser, so mirror its txt() filter here and
+# test the logic directly. Regression: an earlier version removed every <i> in
+# the subtree, which erased the headline itself and made every UPS row fail with
+# "no status found".
+_LIGATURE = re.compile(
+    re.search(r"const LIGATURE = /(.+?)/;", _EXTRACT_JS).group(1)
+)
+
+
+def _txt(raw: str):
+    """Python mirror of the extract script's txt() helper."""
+    raw = " ".join(raw.split()).strip()
+    if not raw:
+        return None
+    kept = " ".join(w for w in raw.split(" ") if not _LIGATURE.match(w)).strip()
+    return kept or raw
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("Delivered check_circle", "Delivered"),
+        ("check_circle Delivered", "Delivered"),
+        ("Out For Delivery Today local_shipping", "Out For Delivery Today"),
+        ("Delivered", "Delivered"),
+        ("On the Way", "On the Way"),
+        ("Label Created", "Label Created"),
+        ("Delivered to UPS Access Point", "Delivered to UPS Access Point"),
+        ("", None),
+    ],
+)
+def test_icon_ligatures_are_dropped_from_the_status(raw, expected):
+    assert _txt(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw", ["Delivered", "check_circle", "On the Way", "In Transit", "x"]
+)
+def test_filtering_never_empties_a_non_empty_status(raw):
+    """The regression that broke every UPS row: stripping returned nothing."""
+    assert _txt(raw), "a non-empty headline must never filter down to nothing"
+
+
+def test_the_extractor_no_longer_deletes_dom_nodes():
+    """Removing every <i> in the subtree is what erased the headline."""
+    assert "querySelectorAll(ICONS)" not in _EXTRACT_JS
+    assert "LIGATURE" in _EXTRACT_JS
