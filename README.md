@@ -27,6 +27,10 @@ runner.py            batch job: read CSV -> scrape each -> save to DB
   ├─ storage.py         SQLite: latest status + full event history
   ├─ models.py          the ONE normalized data shape (pydantic)
   └─ config.py          the ONE file you edit to enable proxies/CAPTCHA
+
+index.py             web API: /api/track (one shipment) + /api/batch (upload)
+  └─ batch.py          spreadsheet upload: parse company/awb -> background job
+                       -> poll for progress -> download results as .xlsx
 ```
 
 ## Setup
@@ -62,7 +66,43 @@ Interactive docs at `http://127.0.0.1:8000/docs`.
 | Method | Path                                    | Purpose                                            |
 | ------ | --------------------------------------- | -------------------------------------------------- |
 | `GET`  | `/api/health`                           | Liveness check.                                    |
-| `GET`  | `/api/track?carrier=&tracking_number=`  | Live scrape; returns the normalized result. No storage. |
+| `GET`  | `/api/track?carrier=&tracking_number=`  | Live scrape of one shipment; returns the normalized result. No storage. |
+| `POST` | `/api/batch`                            | Upload an Excel/CSV of `company` + `awb` rows. Returns a queued job (202). |
+| `GET`  | `/api/batch`                            | Recent jobs, newest first (no rows).               |
+| `GET`  | `/api/batch/{job_id}`                   | Job progress + every row's live state and result. Poll this. |
+| `POST` | `/api/batch/{job_id}/cancel`            | Stop a run; in-flight rows finish, the rest are skipped. |
+| `GET`  | `/api/batch/{job_id}/export.xlsx`       | Results workbook (summary sheet + full event history). |
+| `GET`  | `/api/batch/template.xlsx`              | Blank two-column upload template.                  |
+
+### Bulk tracking from a spreadsheet
+
+Upload a sheet with a **`company`** and an **`awb`** column:
+
+| company | awb                |
+| ------- | ------------------ |
+| UPS     | 1Z999AA10123456784 |
+| FedEx   | 987654321098       |
+| DHL     | 1234567890         |
+| Aramex  | 4567891234         |
+
+* Header names are matched loosely — `carrier`, `courier`, `AWB No.`,
+  `Tracking Number` and friends all work, and extra columns are ignored.
+* Company values are resolved to a carrier case-insensitively, including
+  variants like `DHL Express` and `Federal Express`.
+* Rows that can't be tracked (unknown company, missing/illegal AWB, duplicates)
+  are kept and reported with a per-row error rather than failing the upload.
+* Limits: 5 MB, 500 rows per file, `.xlsx`/`.xlsm`/`.csv` only.
+
+Scraping N rows takes minutes, so the upload only parses and queues. Rows are
+scraped by a small background pool (`?concurrency=`, default 2 — each worker
+drives its own Chrome) and the client polls the job. **Jobs live in memory only:
+restarting the API clears them.**
+
+```bash
+curl -F file=@shipments.xlsx http://127.0.0.1:8000/api/batch      # -> {"id": "...", ...}
+curl http://127.0.0.1:8000/api/batch/<id>                          # progress
+curl -O -J http://127.0.0.1:8000/api/batch/<id>/export.xlsx        # results
+```
 
 `CORS_ORIGINS` (comma-separated) controls allowed frontend origins
 (default `http://localhost:3000,http://127.0.0.1:3000`).
@@ -74,18 +114,55 @@ Interactive docs at `http://127.0.0.1:8000/docs`.
 ## Tests
 
 ```bash
-python -m pytest -q      # scraper parsers + /api/track (mocked scraper, no network)
+python -m pytest -q      # scraper parsers + /api/track + /api/batch
+                         # (scrapers mocked — no browser, no network)
 ```
 
-## Deploying (important)
+## Deploy on an Azure VM
 
-The scrapers drive a real Chrome via SeleniumBase UC Mode, so the server needs:
-- **Google Chrome installed** (SeleniumBase auto-manages the driver).
-- **A display**: UC Mode is strongest *headed*. On a Linux server run under a
-  virtual display (`xvfb-run ...`) rather than `HEADLESS=true` where possible.
-- **Residential proxies at volume** — set `USE_PROXIES=true` + `PROXY_URL`.
-  Without them you *will* get blocked beyond low volumes (single lookups are fine).
-- Each request launches a browser (~20–40s). Size concurrency accordingly.
+The scrapers drive a real Chrome via SeleniumBase UC Mode, so it runs on a Linux
+VM (not a serverless host). Everything lives in `deploy/`:
+
+| File                        | Purpose                                             |
+| --------------------------- | --------------------------------------------------- |
+| `deploy/setup.sh`           | One-time provisioning: Chrome + Xvfb + Python venv. |
+| `deploy/tracker.env.example`| systemd env template (bind, display, **proxy**, CORS). |
+| `deploy/tracker.service`    | systemd unit — auto-start + auto-restart.           |
+
+**Steps (Ubuntu 22.04/24.04 VM):**
+
+```bash
+# 1. Clone the repo on the VM, then from backend/:
+bash deploy/setup.sh                       # installs Chrome, Xvfb, deps into .venv
+
+# 2. Configure runtime env (bind, proxy, CORS):
+cp deploy/tracker.env.example deploy/tracker.env
+nano deploy/tracker.env                     # set a REAL PROXY_URL (see below)
+sudo cp deploy/tracker.env /etc/tracker.env
+
+# 3. Install + start the service (edit User/paths in the unit first if not azureuser):
+sudo cp deploy/tracker.service /etc/systemd/system/tracker.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now tracker
+systemctl status tracker                    # should be active (running)
+journalctl -u tracker -f                    # live logs
+
+# 4. Open the port in the Azure Network Security Group (inbound: TCP 8000),
+#    or put Nginx/Caddy in front for TLS on 443.
+```
+
+Redeploy after a code change: `git pull && sudo systemctl restart tracker`.
+
+**Notes:**
+- The VM runs Chrome **headed inside Xvfb** (`HEADLESS=false`, `USE_XVFB=true`) —
+  SeleniumBase manages the virtual display itself, so no separate Xvfb process.
+- ⚠️ **An Azure VM IP is a datacenter IP** and gets blocked by the carriers'
+  anti-bot just like any cloud host. A **residential/mobile proxy**
+  (`USE_PROXIES=true` + `PROXY_URL`) is still required — this is the single
+  biggest factor. `config.py` warns loudly on startup if `USE_PROXIES=true` but
+  `PROXY_URL` is empty.
+- Each request launches a browser (~20–40s) and is memory-hungry — use a VM with
+  **≥2 GB RAM** and keep concurrency low.
 
 ## IMPORTANT — two things you must do before this returns real data
 

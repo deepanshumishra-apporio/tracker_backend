@@ -4,6 +4,12 @@ Web API for the multi-carrier tracker (live, no-storage).
 A user picks a carrier + tracking number; the API scrapes the carrier live and
 returns a normalized result. Nothing is persisted — the result is ephemeral.
 
+Two ways in:
+  * GET  /api/track  — one shipment, scraped inline.
+  * POST /api/batch  — upload a company/awb spreadsheet; rows are scraped by a
+                       background pool and polled via GET /api/batch/{id}
+                       (see batch.py).
+
 Run (dev):
     uvicorn index:app --reload --port 8000
     # or: python index.py
@@ -17,10 +23,19 @@ import os
 import re
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query, status as http_status
+from fastapi import (
+    FastAPI,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+    status as http_status,
+)
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 
+import batch
 from models import Carrier, Status, TrackingEvent, TrackingResult
 from scrapers.aramex import AramexScraper
 from scrapers.dhl import DHLScraper
@@ -62,6 +77,61 @@ class ShipmentOut(BaseModel):
     error: Optional[str] = None
 
 
+class BatchJobOut(BaseModel):
+    """Live state of a bulk-upload job (see batch.BatchJob.to_dict)."""
+    id: str
+    filename: str
+    state: str
+    created_at: str
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    notes: list[str] = []
+    counts: dict[str, int] = {}
+    progress: float = 0.0
+    rows: list[dict] = []
+
+
+def _validate_number(number: str) -> str:
+    """Shared tracking-number check for the single and bulk paths."""
+    number = number.strip()
+    if not _TRACKING_RE.match(number):
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="tracking_number may only contain letters, digits, and hyphens",
+        )
+    return number
+
+
+def scrape_one(carrier: Carrier, number: str) -> dict:
+    """Scrape a single shipment and return the JSON-ready ShipmentOut payload.
+
+    Failures are returned as an ``ok: False`` result rather than raised, so a
+    bulk run keeps going when one carrier blocks us. Looks the scraper up in
+    SCRAPERS at call time so tests can monkeypatch it.
+    """
+    scraper = SCRAPERS[carrier]
+    try:
+        result = scraper.scrape(number)
+    except Exception as exc:  # blocked after retries, timeout, etc.
+        result = TrackingResult.failure(number, carrier, str(exc))
+    return ShipmentOut(**result.model_dump(mode="json")).model_dump(mode="json")
+
+
+def _xlsx_response(data: bytes, filename: str) -> Response:
+    return Response(
+        content=data,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            # The browser fetches this cross-origin; without this the JS can't
+            # read the filename off the response.
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        },
+    )
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="Multi-Carrier Tracker API",
@@ -96,18 +166,82 @@ def create_app() -> FastAPI:
         carrier: Carrier,
         tracking_number: str = Query(..., min_length=1, max_length=64),
     ) -> ShipmentOut:
-        number = tracking_number.strip()
-        if not _TRACKING_RE.match(number):
-            raise HTTPException(
-                status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="tracking_number may only contain letters, digits, and hyphens",
-            )
-        scraper = SCRAPERS[carrier]
+        number = _validate_number(tracking_number)
+        return ShipmentOut(**scrape_one(carrier, number))
+
+    # -----------------------------------------------------------------------
+    # Bulk tracking from an uploaded spreadsheet (company + awb columns).
+    #
+    # Scraping N rows takes minutes, so the upload only parses and queues; the
+    # rows are scraped by a background pool and the client polls GET /api/batch
+    # /{job_id} for progress. Jobs live in memory only.
+    # -----------------------------------------------------------------------
+    @app.post(
+        "/api/batch",
+        response_model=BatchJobOut,
+        status_code=http_status.HTTP_202_ACCEPTED,
+    )
+    async def create_batch(
+        file: UploadFile = File(..., description="Excel/CSV with 'company' and 'awb' columns"),
+        concurrency: int = Query(
+            batch.DEFAULT_CONCURRENCY,
+            ge=1,
+            le=8,
+            description="Rows scraped in parallel. Each one drives its own browser.",
+        ),
+    ) -> BatchJobOut:
+        # UploadFile is async; read it here and hand plain bytes to the parser.
+        data = await file.read()
         try:
-            result = scraper.scrape(number)
-        except Exception as exc:  # blocked after retries, timeout, etc.
-            result = TrackingResult.failure(number, carrier, str(exc))
-        return ShipmentOut(**result.model_dump(mode="json"))
+            parsed = batch.parse_workbook(file.filename or "upload.xlsx", data)
+        except batch.UploadError as exc:
+            raise HTTPException(
+                status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(exc)
+            ) from exc
+        job = batch.JOBS.create(parsed, scrape_one, concurrency=concurrency)
+        return BatchJobOut(**job.to_dict())
+
+    @app.get("/api/batch", response_model=list[BatchJobOut])
+    def list_batches() -> list[BatchJobOut]:
+        """Recent jobs, newest first — without rows, so it stays small."""
+        return [BatchJobOut(**j.to_dict(include_rows=False)) for j in batch.JOBS.list()]
+
+    @app.get("/api/batch/template.xlsx")
+    def batch_template() -> Response:
+        """Blank upload template with the two required columns."""
+        return _xlsx_response(batch.build_template_xlsx(), "tracking-template.xlsx")
+
+    @app.get("/api/batch/{job_id}", response_model=BatchJobOut)
+    def get_batch(job_id: str) -> BatchJobOut:
+        job = batch.JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND,
+                detail="No such job — it may have expired when the server restarted.",
+            )
+        return BatchJobOut(**job.to_dict())
+
+    @app.post("/api/batch/{job_id}/cancel", response_model=BatchJobOut)
+    def cancel_batch(job_id: str) -> BatchJobOut:
+        """Stop a run. Rows already in flight finish; the rest are skipped."""
+        job = batch.JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND, detail="No such job."
+            )
+        job.cancel()
+        return BatchJobOut(**job.to_dict())
+
+    @app.get("/api/batch/{job_id}/export.xlsx")
+    def export_batch(job_id: str) -> Response:
+        """Download the job's results (plus full event history) as .xlsx."""
+        job = batch.JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND, detail="No such job."
+            )
+        name = batch.safe_filename(job.filename)
+        return _xlsx_response(batch.build_results_xlsx(job), f"{name}-results.xlsx")
 
     return app
 
