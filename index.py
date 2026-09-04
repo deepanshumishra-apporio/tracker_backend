@@ -174,9 +174,24 @@ def create_app() -> FastAPI:
     ]
     extra = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
     origins = default_origins + extra
+
+    # A fixed list alone cannot hold: Vercel gives every branch and every
+    # deployment its own hostname (tracker-frontend-tawny-git-<branch>-<scope>
+    # .vercel.app), and a dev server whose port 3000 was taken lands on 3001 or
+    # higher. Both then get "Disallowed CORS origin", which reaches the user as
+    # "Cannot reach the tracker API" — the API is fine, the browser simply threw
+    # the answer away. The pattern stays scoped to this project's own previews
+    # rather than all of vercel.app, and to loopback for local work.
+    default_origin_regex = (
+        r"^https://tracker-frontend[a-z0-9-]*\.vercel\.app$"
+        r"|^http://(localhost|127\.0\.0\.1)(:\d+)?$"
+    )
+    origin_regex = os.getenv("CORS_ORIGIN_REGEX", default_origin_regex)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
+        allow_origin_regex=origin_regex,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -256,6 +271,27 @@ def create_app() -> FastAPI:
                 status_code=http_status.HTTP_404_NOT_FOUND, detail="No such job."
             )
         job.cancel()
+        return BatchJobOut(**job.to_dict())
+
+    @app.post("/api/batch/{job_id}/rows/{index}/retry", response_model=BatchJobOut)
+    def retry_batch_row(job_id: str, index: int) -> BatchJobOut:
+        """Re-run one row's lookup, without re-uploading the spreadsheet.
+
+        Returns the job immediately with that row back in "running"; the client
+        polls as it would for the original run. A duplicate refreshes the row it
+        mirrors, so every copy of that waybill updates together.
+        """
+        job = batch.JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(
+                status_code=http_status.HTTP_404_NOT_FOUND, detail="No such job."
+            )
+        try:
+            batch.JOBS.retry(job, index, carrier_session)
+        except batch.RowNotRetryable as exc:
+            raise HTTPException(
+                status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)
+            ) from exc
         return BatchJobOut(**job.to_dict())
 
     @app.get("/api/batch/{job_id}/export.xlsx")
