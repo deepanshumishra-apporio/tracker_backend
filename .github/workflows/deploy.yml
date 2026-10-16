@@ -1,0 +1,66 @@
+# CI/CD: every push runs the tests; a push to main that passes them is
+# deployed to the Azure VM over SSH with deploy/update.sh (pull, install deps,
+# import check, restart, health check, automatic rollback on failure).
+#
+# One-time setup — repo Settings -> Secrets and variables -> Actions:
+#   SSH_HOST      the VM's address, e.g. 20.193.153.56
+#   SSH_USER      the login user on the VM
+#   SSH_KEY       a PRIVATE key whose public half is in that user's
+#                 ~/.ssh/authorized_keys (key login, never a password)
+#   DEPLOY_PATH   the backend directory on the VM, e.g. /home/<user>/tracker_backend
+# The VM user also needs passwordless sudo for `systemctl restart tracker`
+# (update.sh restarts the service), and the checkout there must be on main.
+name: CI/CD
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run tests
+        # Tests fake every carrier and browser: nothing leaves the runner.
+        env:
+          FAST_ENABLED: "false"
+          REFRESH_ENABLED: "false"
+        run: python -m pytest -q
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy with deploy/update.sh
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes "$SSH_USER@$SSH_HOST" \
+            "cd '$DEPLOY_PATH' && git checkout -q main && bash deploy/update.sh"

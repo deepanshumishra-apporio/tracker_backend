@@ -1,11 +1,14 @@
 """
-Web API for the multi-carrier tracker (live, no-storage).
+Web API for the multi-carrier tracker.
 
-A user picks a carrier + tracking number; the API scrapes the carrier live and
-returns a normalized result. Nothing is persisted — the result is ephemeral.
+Lookups go through tracking_service: a saved result that is still fresh is
+returned from SQLite in milliseconds; otherwise the carrier is asked via the
+fast HTTP fetchers (fast/), falling back to the browser scrapers. Every result
+is saved, and a background refresher keeps undelivered shipments current.
 
-Two ways in:
-  * GET  /api/track  — one shipment, scraped inline.
+Ways in:
+  * GET  /api/track      — one shipment (cache, or live with refresh=true).
+  * GET  /api/shipments  — search everything saved.
   * POST /api/batch  — upload a company/awb spreadsheet; rows are scraped by a
                        background pool and polled via GET /api/batch/{id}
                        (see batch.py).
@@ -14,15 +17,13 @@ Run (dev):
     uvicorn index:app --reload --port 8000
     # or: python index.py
 
-(An optional batch scraper that DOES persist to SQLite lives in runner.py +
-storage.py; it is independent of this web API.)
 """
 from __future__ import annotations
 
 import os
 import re
-from contextlib import contextmanager
-from typing import Callable, Iterator, Optional
+from contextlib import asynccontextmanager, contextmanager
+from typing import Any, Callable, Iterator, Optional
 
 from fastapi import (
     FastAPI,
@@ -37,6 +38,9 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 import batch
+import config
+import storage
+import tracking_service
 from models import Carrier, Status, TrackingEvent, TrackingResult
 from scrapers.aramex import AramexScraper
 from scrapers.dhl import DHLScraper
@@ -76,6 +80,7 @@ class ShipmentOut(BaseModel):
     scraped_at: Optional[str] = None
     ok: bool = True
     error: Optional[str] = None
+    from_cache: bool = False
 
 
 class BatchJobOut(BaseModel):
@@ -129,18 +134,41 @@ def carrier_session(carrier: Carrier) -> Iterator[Callable[[str], dict]]:
         yield lambda number: _payload(session.track(number))
 
 
-def scrape_one(carrier: Carrier, number: str) -> dict:
-    """Scrape a single shipment in its own browser.
+@contextmanager
+def browser_session(carrier: Carrier) -> Iterator[Callable[[str], TrackingResult]]:
+    """carrier_session, but yielding raw TrackingResults — the browser
+    fallback tracking_service uses behind its fast fetchers."""
+    scraper = SCRAPERS[carrier]
+    opener = getattr(scraper, "session", None)
+    if opener is None:
+        yield scraper.scrape
+        return
+    with opener() as session:
+        yield session.track
 
-    Failures are returned as an ``ok: False`` result rather than raised, so the
-    endpoint always answers. Looks the scraper up in SCRAPERS at call time so
-    tests can monkeypatch it.
-    """
-    try:
-        with carrier_session(carrier) as track:
-            return track(number)
-    except Exception as exc:  # blocked after retries, timeout, etc.
-        return _payload(TrackingResult.failure(number, carrier, str(exc)))
+
+@contextmanager
+def refresh_session(carrier: Carrier) -> Iterator[Callable[[str], dict]]:
+    """Per-number lookups that skip the cache but use the fast path and save
+    the result — for an explicit single-row refresh."""
+    yield lambda number: _payload(
+        tracking_service.track_one(carrier, number, browser_session, use_cache=False)[0]
+    )
+
+
+def bulk_track(
+    items: list[tuple[Carrier, str]],
+    on_result: Callable[[Carrier, str, dict], None],
+    cancelled: Callable[[], bool],
+) -> None:
+    """Batch runner hook: cache hits instantly, then the fast fetchers for
+    all rows at once, then the browser for whatever they couldn't answer."""
+    tracking_service.track_many(
+        items,
+        browser_session,
+        on_result=lambda c, n, r, _cached: on_result(c, n, _payload(r)),
+        cancelled=cancelled,
+    )
 
 
 def _xlsx_response(data: bytes, filename: str) -> Response:
@@ -159,7 +187,17 @@ def _xlsx_response(data: bytes, filename: str) -> Response:
 
 
 def create_app() -> FastAPI:
+    refresher = tracking_service.Refresher(browser_session)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        if config.REFRESH_ENABLED:
+            refresher.start()
+        yield
+        refresher.stop()
+
     app = FastAPI(
+        lifespan=lifespan,
         title="Multi-Carrier Tracker API",
         version="1.0.0",
         description="Live UPS / FedEx / DHL / Aramex tracking (no storage).",
@@ -197,18 +235,27 @@ def create_app() -> FastAPI:
     )
 
     @app.get("/api/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    def health() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "fast_path": sorted(c.value for c in tracking_service.FAST),
+            "last_refresh": refresher.last_sweep or None,
+        }
 
-    # Sync `def` (not async) so FastAPI runs the blocking scrape in a threadpool
-    # and the event loop stays responsive. Nothing is persisted.
+    # Sync `def` (not async) so FastAPI runs the blocking lookup in a threadpool
+    # and the event loop stays responsive. A fresh-enough saved result is
+    # returned straight from the database; refresh=true forces a live lookup.
     @app.get("/api/track", response_model=ShipmentOut)
     def track(
         carrier: Carrier,
         tracking_number: str = Query(..., min_length=1, max_length=64),
+        refresh: bool = Query(False, description="Skip the cache and ask the carrier now."),
     ) -> ShipmentOut:
         number = _validate_number(tracking_number)
-        return ShipmentOut(**scrape_one(carrier, number))
+        result, from_cache = tracking_service.track_one(
+            carrier, number, browser_session, use_cache=not refresh
+        )
+        return ShipmentOut(**{**_payload(result), "from_cache": from_cache})
 
     # -----------------------------------------------------------------------
     # Bulk tracking from an uploaded spreadsheet (company + awb columns).
@@ -239,7 +286,12 @@ def create_app() -> FastAPI:
             raise HTTPException(
                 status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(exc)
             ) from exc
-        job = batch.JOBS.create(parsed, carrier_session, concurrency=concurrency)
+        job = batch.JOBS.create(
+            parsed, carrier_session, concurrency=concurrency,
+            # With fast fetchers the whole upload is tracked in bulk (cached rows
+            # instantly); without them, per-carrier browser sessions as before.
+            bulk=bulk_track if tracking_service.FAST else None,
+        )
         return BatchJobOut(**job.to_dict())
 
     @app.get("/api/batch", response_model=list[BatchJobOut])
@@ -287,7 +339,7 @@ def create_app() -> FastAPI:
                 status_code=http_status.HTTP_404_NOT_FOUND, detail="No such job."
             )
         try:
-            batch.JOBS.retry(job, index, carrier_session)
+            batch.JOBS.retry(job, index, refresh_session)
         except batch.RowNotRetryable as exc:
             raise HTTPException(
                 status_code=http_status.HTTP_409_CONFLICT, detail=str(exc)
@@ -304,6 +356,21 @@ def create_app() -> FastAPI:
             )
         name = batch.safe_filename(job.filename)
         return _xlsx_response(batch.build_results_xlsx(job), f"{name}-results.xlsx")
+
+    @app.get("/api/shipments")
+    def list_shipments(
+        status: Optional[Status] = None,
+        carrier: Optional[Carrier] = None,
+        search: Optional[str] = Query(None, max_length=64),
+    ) -> list[dict[str, Any]]:
+        """Search every saved shipment (milliseconds — straight from SQLite).
+        The background refresher keeps undelivered ones current."""
+        storage.ensure_db()
+        return storage.list_shipments(
+            status=status.value if status else None,
+            carrier=carrier.value if carrier else None,
+            search=search,
+        )
 
     return app
 

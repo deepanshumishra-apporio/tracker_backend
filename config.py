@@ -111,3 +111,40 @@ SOLVE_CAPTCHA = os.getenv("SOLVE_CAPTCHA", "true").lower() == "true"
 # STORAGE
 # ---------------------------------------------------------------------------
 DB_PATH = os.getenv("DB_PATH", "tracking.db")
+
+
+# Rows accepted per bulk upload. The fast path handles thousands; on the
+# browser scrapers alone (~40s a row) keep this low.
+BATCH_MAX_ROWS = max(1, int(os.getenv("BATCH_MAX_ROWS", "500")))
+
+# ---------------------------------------------------------------------------
+# FAST PATH  (browserless HTTP fetchers in fast/, browser scrapers as fallback)
+# ---------------------------------------------------------------------------
+FAST_ENABLED = os.getenv("FAST_ENABLED", "true").lower() == "true"
+FAST_TIMEOUT = float(os.getenv("FAST_TIMEOUT", "30"))
+# Parallel HTTP requests per carrier. These are tiny compared to a browser.
+FAST_WORKERS = max(1, int(os.getenv("FAST_WORKERS", "8")))
+# Numbers per Aramex results page (its page accepts a comma-separated list).
+ARAMEX_CHUNK = max(1, int(os.getenv("ARAMEX_CHUNK", "10")))
+# UPS: a real browser opens ups.com once to earn Akamai cookies; they are then
+# reused for plain JSON calls until they expire (401/403) or reach this age.
+UPS_COOKIE_TTL = float(os.getenv("UPS_COOKIE_TTL", "900"))
+
+# ---------------------------------------------------------------------------
+# CACHE + BACKGROUND REFRESH
+# ---------------------------------------------------------------------------
+# Every result is saved to DB_PATH. A lookup younger than its status's max age
+# is answered from the database (milliseconds) instead of the carrier.
+# Delivered shipments never change, so they are never re-fetched.
+CACHE_MAX_AGE = {
+    "out_for_delivery": float(os.getenv("MAX_AGE_OUT_FOR_DELIVERY", str(30 * 60))),
+    "in_transit": float(os.getenv("MAX_AGE_IN_TRANSIT", str(2 * 3600))),
+    "exception": float(os.getenv("MAX_AGE_EXCEPTION", str(2 * 3600))),
+    "pending": float(os.getenv("MAX_AGE_PENDING", str(4 * 3600))),
+    "unknown": float(os.getenv("MAX_AGE_FAILED", str(6 * 3600))),
+    "delivered": float("inf"),
+}
+# The refresher re-fetches stale, undelivered shipments in the background.
+REFRESH_ENABLED = os.getenv("REFRESH_ENABLED", "true").lower() == "true"
+REFRESH_INTERVAL = float(os.getenv("REFRESH_INTERVAL", "300"))   # seconds between sweeps
+REFRESH_BATCH = max(1, int(os.getenv("REFRESH_BATCH", "200")))   # shipments per sweep

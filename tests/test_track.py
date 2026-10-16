@@ -64,7 +64,8 @@ def test_track_reports_scrape_failure_without_500(client: TestClient, monkeypatc
     assert r.status_code == 200
     body = r.json()
     assert body["ok"] is False
-    assert "bot-check wall" in body["error"]
+    # Same readable wording the bulk rows use, not the raw exception text.
+    assert "bot-check blocked us" in body["error"]
 
 
 def test_track_validates_inputs(client: TestClient):
@@ -73,14 +74,18 @@ def test_track_validates_inputs(client: TestClient):
     assert client.get("/api/track?carrier=ups&tracking_number=").status_code == 422
 
 
-def test_track_does_not_persist(client: TestClient, monkeypatch, tmp_path):
-    import config
+def test_track_saves_and_serves_from_cache(client: TestClient, monkeypatch):
     import storage
 
-    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "track.db"))
-    storage.init_db()
-    monkeypatch.setitem(index.SCRAPERS, Carrier.DHL, _FakeScraper(_sample("NOPERSIST")))
+    scraper = _FakeScraper(_sample("PERSIST"))
+    calls = []
+    original = scraper.scrape
+    scraper.scrape = lambda n: (calls.append(n), original(n))[1]
+    monkeypatch.setitem(index.SCRAPERS, Carrier.DHL, scraper)
 
-    client.get("/api/track?carrier=dhl&tracking_number=NOPERSIST")
-    # The live track flow must never write to the store.
-    assert storage.list_shipments() == []
+    first = client.get("/api/track?carrier=dhl&tracking_number=PERSIST").json()
+    second = client.get("/api/track?carrier=dhl&tracking_number=PERSIST").json()
+    # Every lookup is saved; a delivered shipment never needs the carrier again.
+    assert [s["tracking_number"] for s in storage.list_shipments()] == ["PERSIST"]
+    assert first["from_cache"] is False and second["from_cache"] is True
+    assert calls == ["PERSIST"]

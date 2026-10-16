@@ -5,6 +5,27 @@ results in SQLite. Engine is **SeleniumBase UC Mode** — purpose-built to beat
 Cloudflare / DataDome / Imperva bot-detection — with proxy rotation, human-like
 delays, retries, and auto-CAPTCHA clicking.
 
+## Fast path + cache (no paid services)
+
+`tracking_service.py` answers every lookup in this order:
+
+1. **Cache.** Every result is saved to SQLite (`DB_PATH`). If the saved result
+   is younger than its status allows (`CACHE_MAX_AGE` in `config.py`), it is
+   returned straight from the database in milliseconds. Delivered shipments
+   are never fetched again.
+2. **Fast HTTP fetchers** (`fast/`). These use plain HTTPS with Chrome's TLS
+   fingerprint (`curl_cffi`), with no browser per number:
+   - **Aramex:** the server-rendered results page takes 10 numbers per request,
+     plus one details page each for the full history.
+   - **UPS:** one stealth-browser visit earns Akamai cookies. Those are reused
+     for parallel calls to UPS's own JSON API until they expire.
+3. **Browser scrapers** (`scrapers/`) handle whatever the fast path couldn't
+   answer, plus DHL and FedEx.
+
+A background **refresher** re-tracks stale, undelivered shipments every
+`REFRESH_INTERVAL` seconds. `GET /api/shipments?search=…&status=…` searches
+everything saved, and `GET /api/track?...&refresh=true` skips the cache.
+
 ## Why SeleniumBase UC Mode
 Plain Selenium/Playwright get flagged instantly by these carriers. UC Mode:
 - renames the CDP console variables anti-bot scripts scan for
