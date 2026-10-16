@@ -48,7 +48,9 @@ _MIGRATION_COLUMNS = {
 
 @contextmanager
 def _conn():
-    con = sqlite3.connect(config.DB_PATH)
+    # timeout: the API, bulk jobs and the refresher write from several threads;
+    # wait for a lock instead of failing with "database is locked".
+    con = sqlite3.connect(config.DB_PATH, timeout=30)
     con.row_factory = sqlite3.Row
     try:
         yield con
@@ -59,12 +61,63 @@ def _conn():
 
 def init_db() -> None:
     with _conn() as con:
+        con.execute("PRAGMA journal_mode=WAL")  # readers never wait on a writer
         con.execute(_SCHEMA)
         # Upgrade older databases: add any missing columns.
         existing = {row["name"] for row in con.execute("PRAGMA table_info(shipments)")}
         for col, decl in _MIGRATION_COLUMNS.items():
             if col not in existing:
                 con.execute(f"ALTER TABLE shipments ADD COLUMN {col} {decl}")
+
+
+_ready: set[str] = set()
+
+
+def ensure_db() -> None:
+    """init_db() once per database path for the life of the process."""
+    if config.DB_PATH not in _ready:
+        init_db()
+        _ready.add(config.DB_PATH)
+
+
+def touch(carrier: str, tracking_number: str) -> None:
+    """Mark a stored shipment as just-checked without changing its data.
+
+    Used when a refresh FAILS for a shipment we already hold good data for —
+    e.g. UPS stops showing a parcel ~120 days after delivery. Overwriting would
+    replace a real history with an error; touching keeps the history and stops
+    the refresher retrying it every sweep."""
+    with _conn() as con:
+        con.execute(
+            "UPDATE shipments SET scraped_at = ? WHERE carrier = ? AND tracking_number = ?",
+            (datetime.now(timezone.utc).isoformat(), carrier, tracking_number),
+        )
+
+
+def stale_shipments(max_age: dict[str, float], limit: int) -> list[tuple[str, str]]:
+    """(carrier, tracking_number) of shipments older than their status allows,
+    oldest first. Delivered rows (infinite max age) are never returned."""
+    now = datetime.now(timezone.utc)
+    out: list[tuple[str, str, float]] = []
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT carrier, tracking_number, status, ok, scraped_at FROM shipments "
+            "WHERE status != 'delivered'"
+        ).fetchall()
+    for r in rows:
+        key = r["status"] if r["ok"] else "unknown"
+        allowed = max_age.get(key, max_age.get("unknown", 0))
+        if r["scraped_at"]:
+            try:
+                age = (now - datetime.fromisoformat(r["scraped_at"])).total_seconds()
+            except (ValueError, TypeError):   # unparseable or naive timestamp
+                age = float("inf")
+        else:
+            age = float("inf")
+        if age >= allowed:
+            out.append((r["carrier"], r["tracking_number"], age))
+    out.sort(key=lambda t: -t[2])
+    return [(c, n) for c, n, _ in out[:limit]]
 
 
 def save(result: TrackingResult) -> None:

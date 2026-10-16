@@ -42,7 +42,7 @@ from scrapers.base import humanize_error
 # Limits — a spreadsheet is user input, so cap what we will accept.
 # ---------------------------------------------------------------------------
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024   # 5 MB
-MAX_ROWS = 500                       # rows tracked per upload
+MAX_ROWS = config.BATCH_MAX_ROWS        # rows tracked per upload
 MAX_JOBS = 50                        # jobs retained in memory (oldest evicted)
 
 # How many rows are scraped at once. Each worker drives its own Chrome, so this
@@ -50,6 +50,17 @@ MAX_JOBS = 50                        # jobs retained in memory (oldest evicted)
 DEFAULT_CONCURRENCY = config.BATCH_CONCURRENCY
 
 _TRACKING_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
+
+
+# bulk(items, on_result, cancelled): track every (carrier, awb) in one go,
+# calling on_result(carrier, awb, payload) as each settles. Used instead of the
+# per-row browser sessions when the fast HTTP fetchers are available.
+BulkTracker = Callable[
+    [list[tuple[Carrier, str]],
+     Callable[[Carrier, str, dict[str, Any]], None],
+     Callable[[], bool]],
+    None,
+]
 
 
 class UploadError(Exception):
@@ -472,6 +483,7 @@ class JobRegistry:
         session_factory: Callable[[Carrier], AbstractContextManager],
         *,
         concurrency: int = DEFAULT_CONCURRENCY,
+        bulk: Optional[BulkTracker] = None,
     ) -> BatchJob:
         rows = [
             JobRow(
@@ -518,7 +530,10 @@ class JobRegistry:
             mirrors=dict(mirrors),
         )
         self._register(job)
-        self._start(job, session_factory, concurrency)
+        if bulk is not None:
+            self._start_bulk(job, bulk)
+        else:
+            self._start(job, session_factory, concurrency)
         return job
 
     def _start(
@@ -564,6 +579,68 @@ class JobRegistry:
 
         threading.Thread(
             target=worker, name=f"batch-job-{job.id}", daemon=True
+        ).start()
+
+
+    def _start_bulk(self, job: BatchJob, bulk: BulkTracker) -> None:
+        """Hand every queued row to an API that takes many numbers per call.
+
+        No browsers to share or split, so there is nothing to plan: one thread
+        gives the whole list to `bulk`, which reports each number as it
+        settles. Rows it never reports (an outage mid-run) are failed, never
+        left hanging in "running".
+        """
+        pending = [r for r in job.rows if r.state == "queued"]
+        if not pending:
+            job.state = "completed"
+            job.started_at = job.finished_at = _now()
+            return
+
+        by_key: dict[tuple[str, str], list[JobRow]] = defaultdict(list)
+        for row in pending:
+            by_key[(row.carrier or "", row.awb)].append(row)
+
+        def on_result(carrier: Carrier, awb: str, payload: dict[str, Any]) -> None:
+            for row in by_key.get((carrier.value, awb), ()):
+                if row.state != "running":
+                    continue
+                row.result = payload
+                if payload.get("ok"):
+                    row.state, row.error = "done", None
+                else:
+                    row.state = "failed"
+                    row.error = payload.get("error") or "The carrier returned no data."
+                row.finished_at = _now()
+                _mirror(job, row)
+
+        def worker() -> None:
+            job.state = "running"
+            job.started_at = _now()
+            for row in pending:
+                row.state = "running"
+                row.started_at = job.started_at
+            try:
+                bulk(
+                    [(Carrier(r.carrier), r.awb) for r in pending],
+                    on_result,
+                    lambda: job.cancelled,
+                )
+            except Exception as exc:
+                _abandon(pending, humanize_error(exc), state="failed", job=job)
+            finally:
+                if job.cancelled:
+                    _abandon(pending, "Cancelled before this row was tracked.",
+                             state="skipped", job=job)
+                else:
+                    _abandon(pending, "The tracking service returned nothing for this row.",
+                             state="failed", job=job)
+                with job._lock:
+                    if job.state != "cancelled":
+                        job.state = "completed"
+                        job.finished_at = _now()
+
+        threading.Thread(
+            target=worker, name=f"batch-bulk-{job.id}", daemon=True
         ).start()
 
 

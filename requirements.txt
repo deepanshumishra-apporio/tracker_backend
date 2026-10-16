@@ -24,3 +24,6 @@ openpyxl>=3.1.0           # .xlsx read + write (upload parsing, results export)
 
 # Storage: SQLite is built into Python stdlib — no dependency needed.
 # SeleniumBase manages its own chromedriver automatically — no manual driver install.
+
+# Fast path: browserless fetches with Chrome's TLS fingerprint (fast/)
+curl_cffi>=0.7.0          # carriers reject Python's own TLS handshake
