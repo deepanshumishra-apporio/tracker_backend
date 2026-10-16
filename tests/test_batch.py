@@ -100,6 +100,24 @@ def wait_for(client: TestClient, job_id: str, timeout: float = 10.0) -> dict:
     raise AssertionError(f"job {job_id} did not finish within {timeout}s")
 
 
+def wait_for_row(
+    client: TestClient, job_id: str, index: int, timeout: float = 10.0
+) -> dict:
+    """Poll until ONE row settles.
+
+    wait_for() watches the job, which is already "completed" the moment a
+    single-row refresh starts — so waiting on the job would race the refresh.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        body = client.get(f"/api/batch/{job_id}").json()
+        row = body["rows"][index]
+        if row["state"] not in {"queued", "running"}:
+            return body
+        time.sleep(0.02)
+    raise AssertionError(f"row {index} did not settle within {timeout}s")
+
+
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
@@ -476,6 +494,106 @@ def test_a_duplicate_row_keeps_its_carrier_for_the_ui(client: TestClient, monkey
 
     dup = next(r for r in done["rows"] if r["state"] == "duplicate")
     assert dup["carrier"] == "dhl", "the badge should still show which carrier it was"
+
+
+# ---------------------------------------------------------------------------
+# Single-row refresh — re-run one lookup without re-uploading the sheet
+# ---------------------------------------------------------------------------
+def _retry(client: TestClient, job_id: str, index: int):
+    return client.post(f"/api/batch/{job_id}/rows/{index}/retry")
+
+
+def test_a_failed_row_can_be_re_run_on_its_own(client: TestClient, monkeypatch):
+    """The point of the button: chase 11 failures without re-running 288 rows."""
+    scraper = _FakeScraper(Carrier.DHL, boom="wall")
+    monkeypatch.setitem(index.SCRAPERS, Carrier.DHL, scraper)
+    job = upload(client, make_xlsx([["DHL", "111"]])).json()
+    failed = wait_for(client, job["id"])
+    assert failed["rows"][0]["state"] == "failed"
+
+    # The carrier is behaving now.
+    monkeypatch.setitem(index.SCRAPERS, Carrier.DHL, _FakeScraper(Carrier.DHL))
+    assert _retry(client, job["id"], 0).status_code == 200
+
+    done = wait_for_row(client, job["id"], 0)
+    row = done["rows"][0]
+    assert row["state"] == "done"
+    assert row["error"] is None
+    assert row["result"]["status"] == Status.DELIVERED.value
+
+
+def test_refreshing_a_duplicate_refreshes_the_row_it_mirrors(
+    client: TestClient, monkeypatch
+):
+    dhl = _FakeScraper(Carrier.DHL)
+    monkeypatch.setitem(index.SCRAPERS, Carrier.DHL, dhl)
+    job = upload(client, make_xlsx([["DHL", "111"], ["DHL", "111"]])).json()
+    wait_for(client, job["id"])
+    assert dhl.calls == ["111"]
+
+    # Ask on the duplicate (row index 1), not the tracked row.
+    assert _retry(client, job["id"], 1).status_code == 200
+    done = wait_for_row(client, job["id"], 0)
+
+    assert dhl.calls == ["111", "111"], "the source row is what gets looked up"
+    source, dup = done["rows"]
+    assert source["state"] == "done" and dup["state"] == "duplicate"
+    assert dup["result"] == source["result"], "the copy is refreshed too"
+
+
+def test_a_row_with_no_carrier_cannot_be_refreshed(client: TestClient, monkeypatch):
+    monkeypatch.setitem(index.SCRAPERS, Carrier.DHL, _FakeScraper(Carrier.DHL))
+    job = upload(client, make_xlsx([["Blue Dart", "999"]])).json()
+    wait_for(client, job["id"])
+
+    r = _retry(client, job["id"], 0)
+    assert r.status_code == 409
+    assert "no supported carrier" in r.json()["detail"]
+
+
+def test_refreshing_a_row_already_in_flight_is_refused(
+    client: TestClient, monkeypatch
+):
+    """Two browsers on one row would be wasted work and a confusing result."""
+    class _Slow(_FakeScraper):
+        def scrape(self, number):
+            time.sleep(0.4)
+            return super().scrape(number)
+
+    monkeypatch.setitem(index.SCRAPERS, Carrier.DHL, _Slow(Carrier.DHL))
+    job = upload(client, make_xlsx([["DHL", "111"]])).json()
+
+    # While the original run still has it.
+    for _ in range(20):
+        state = client.get(f"/api/batch/{job['id']}").json()["rows"][0]["state"]
+        if state in ("queued", "running"):
+            r = _retry(client, job["id"], 0)
+            assert r.status_code == 409
+            assert "already being tracked" in r.json()["detail"]
+            break
+        time.sleep(0.05)
+    wait_for(client, job["id"])
+
+
+def test_refreshing_an_unknown_row_or_job_404s(client: TestClient, monkeypatch):
+    monkeypatch.setitem(index.SCRAPERS, Carrier.DHL, _FakeScraper(Carrier.DHL))
+    job = upload(client, make_xlsx([["DHL", "111"]])).json()
+    wait_for(client, job["id"])
+
+    assert _retry(client, "nope", 0).status_code == 404
+    assert _retry(client, job["id"], 99).status_code == 409
+
+
+def test_a_refresh_survives_a_cancelled_run(client: TestClient, monkeypatch):
+    """A stopped run must not silently discard a row the user asks for."""
+    monkeypatch.setitem(index.SCRAPERS, Carrier.DHL, _FakeScraper(Carrier.DHL))
+    job = upload(client, make_xlsx([["DHL", "111"]]), concurrency=1).json()
+    wait_for(client, job["id"])
+    client.post(f"/api/batch/{job['id']}/cancel")
+
+    assert _retry(client, job["id"], 0).status_code == 200
+    done = wait_for_row(client, job["id"], 0)
+    assert done["rows"][0]["state"] == "done"
 
 
 # ---------------------------------------------------------------------------

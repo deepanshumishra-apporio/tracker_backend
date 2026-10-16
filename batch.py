@@ -67,6 +67,10 @@ class UploadError(Exception):
     """The file itself is unusable (bad format, no header, no rows)."""
 
 
+class RowNotRetryable(Exception):
+    """A single-row refresh was asked for on a row that cannot be looked up."""
+
+
 # ---------------------------------------------------------------------------
 # Column detection
 # ---------------------------------------------------------------------------
@@ -536,6 +540,49 @@ class JobRegistry:
             self._start(job, session_factory, concurrency)
         return job
 
+    def retry(
+        self,
+        job: BatchJob,
+        index: int,
+        session_factory: Callable[[Carrier], AbstractContextManager],
+    ) -> JobRow:
+        """Re-run ONE row on its own browser, in the background.
+
+        For the rows a carrier refused, or that a rate limit ate, re-uploading
+        the whole spreadsheet to chase a handful of them is the wrong tool.
+        Returns the row that will actually be looked up — for a duplicate that
+        is the row it mirrors, so every copy of that waybill refreshes at once.
+        """
+        try:
+            row = job.rows[index]
+        except IndexError:
+            raise RowNotRetryable("No such row in this job.") from None
+
+        if row.duplicate_of_index is not None:
+            row = job.rows[row.duplicate_of_index]
+
+        if not row.carrier or not row.awb:
+            raise RowNotRetryable(
+                "This row has no supported carrier to look it up with — fix the "
+                "company or AWB in the sheet and upload it again."
+            )
+
+        with job._lock:
+            if row.state in ("queued", "running"):
+                raise RowNotRetryable("That row is already being tracked.")
+            row.state = "running"
+            row.error = None
+            row.started_at = _now()
+            row.finished_at = None
+
+        threading.Thread(
+            target=_retry_row,
+            args=(job, row, session_factory),
+            name=f"batch-retry-{job.id}-{row.index}",
+            daemon=True,
+        ).start()
+        return row
+
     def _start(
         self,
         job: BatchJob,
@@ -580,7 +627,6 @@ class JobRegistry:
         threading.Thread(
             target=worker, name=f"batch-job-{job.id}", daemon=True
         ).start()
-
 
     def _start_bulk(self, job: BatchJob, bulk: BulkTracker) -> None:
         """Hand every queued row to an API that takes many numbers per call.
@@ -688,6 +734,26 @@ def _run_group(
         _abandon(rows, humanize_error(exc), state="failed", job=job)
 
 
+def _retry_row(
+    job: BatchJob,
+    row: JobRow,
+    session_factory: Callable[[Carrier], AbstractContextManager],
+) -> None:
+    """Open a browser for one row, look it up, and mirror the outcome."""
+    try:
+        with session_factory(Carrier(row.carrier)) as track:
+            _track_row(job, row, track)
+    except Exception as exc:
+        # The session itself never opened; the row must not be left "running".
+        row.state = "failed"
+        row.error = humanize_error(exc)
+        row.result = TrackingResult.failure(
+            row.awb, Carrier(row.carrier), row.error
+        ).model_dump(mode="json")
+        row.finished_at = _now()
+        _mirror(job, row)
+
+
 def _abandon(
     rows: list[JobRow], message: str, *, state: str, job: Optional[BatchJob] = None
 ) -> None:
@@ -724,13 +790,23 @@ def _run_row(
     row: JobRow,
     track: Callable[[str], dict[str, Any]],
 ) -> None:
-    """Scrape one row on an open session, recording state. Never raises."""
+    """Scrape one queued row of a live run, recording state. Never raises."""
     if job.cancelled:
         if row.state == "queued":
             row.state = "skipped"
             row.error = "Cancelled before this row ran."
         return
+    _track_row(job, row, track)
 
+
+def _track_row(
+    job: BatchJob,
+    row: JobRow,
+    track: Callable[[str], dict[str, Any]],
+) -> None:
+    """The lookup itself. Shared by the bulk run and a single-row refresh,
+    which is why the cancel check lives in the caller: a refresh is asked for
+    explicitly, per row, and a stopped run must not silently discard it."""
     row.state = "running"
     row.started_at = _now()
     try:
@@ -926,7 +1002,7 @@ def safe_filename(name: str, *, fallback: str = "tracking-results") -> str:
 
 __all__ = [
     "BatchJob", "JobRow", "JobRegistry", "JOBS", "ParsedFile", "ParsedRow",
-    "UploadError", "MAX_ROWS", "MAX_UPLOAD_BYTES", "DEFAULT_CONCURRENCY",
+    "RowNotRetryable", "UploadError", "MAX_ROWS", "MAX_UPLOAD_BYTES", "DEFAULT_CONCURRENCY",
     "parse_workbook", "resolve_carrier", "build_results_xlsx",
     "build_template_xlsx", "safe_filename",
 ]
