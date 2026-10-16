@@ -47,6 +47,14 @@ _MSG_JS = (
 _CLASS_JS = (
     "const e=document.querySelector('[class*=\"c-tracking-result--status-shipment-\"]');"
     "return e?e.className:null;")
+# 'found' once the result renders, 'notfound' once DHL says the lookup failed
+# (its utapi call answered 404), else null while the page is still working.
+_STATE_JS = (
+    "if(document.querySelector('.c-tracking-result--status-copy-message'))return 'found';"
+    "const t=(document.body.innerText||'').toLowerCase();"
+    "return t.includes('your tracking attempt was not successful')?'notfound':null;")
+NOT_FOUND = ("DHL has no shipment with this number (it may be invalid, or aged "
+             "out — DHL keeps tracking for about 90 days).")
 _DETAILS_JS = (
     "const e=document.querySelector('.c-tracking-result--shipment-details');"
     "return e?e.innerText:null;")
@@ -205,12 +213,19 @@ class DHLScraper(BaseScraper):
         return None
 
     def parse_dom(self, sb, tracking_number: str) -> TrackingResult:
-        # Wait for async result to render.
-        for _ in range(18):
-            sb.sleep(2)
-            if sb.execute_script(
-                "return !!document.querySelector('.c-tracking-result--status-copy-message')"):
+        # Wait for async result to render — or for DHL's "not successful"
+        # answer, which arrives just as late (after its ~30s proof-of-work
+        # challenge) but used to be waited out to the full 36s and then
+        # reported as a vague page problem.
+        state = None
+        for _ in range(40):
+            sb.sleep(1)
+            state = sb.execute_script(_STATE_JS)
+            if state:
                 break
+
+        if state == "notfound":
+            return TrackingResult.failure(tracking_number, self.carrier, NOT_FOUND)
 
         msg = sb.execute_script(_MSG_JS)
         cls = sb.execute_script(_CLASS_JS)

@@ -41,7 +41,14 @@ def _build_fast() -> dict[Carrier, Any]:
         return {}
     from fast.aramex import AramexFast
     from fast.ups import UPSFast
-    return {Carrier.ARAMEX: AramexFast(), Carrier.UPS: UPSFast()}
+    fast: dict[Carrier, Any] = {Carrier.ARAMEX: AramexFast(), Carrier.UPS: UPSFast()}
+    if config.DHL_API_KEY:
+        from fast.dhl import DHLFast
+        fast[Carrier.DHL] = DHLFast()
+    if config.FEDEX_API_KEY and config.FEDEX_SECRET_KEY:
+        from fast.fedex import FedExFast
+        fast[Carrier.FEDEX] = FedExFast()
+    return fast
 
 
 # Tests replace this with fakes (or {} to force the browser path).

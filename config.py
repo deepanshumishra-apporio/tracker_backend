@@ -129,6 +129,17 @@ ARAMEX_CHUNK = max(1, int(os.getenv("ARAMEX_CHUNK", "10")))
 # UPS: a real browser opens ups.com once to earn Akamai cookies; they are then
 # reused for plain JSON calls until they expire (401/403) or reach this age.
 UPS_COOKIE_TTL = float(os.getenv("UPS_COOKIE_TTL", "900"))
+# DHL and FedEx websites cannot be fetched without a browser (DHL wants a fresh
+# proof-of-work per call, FedEx's Akamai blocks servers), so their fast path is
+# the carriers' official APIs — switched on by setting these keys.
+# DHL: developer.dhl.com -> "Shipment Tracking - Unified". The free tier allows
+# one call per 5s; lower the interval once DHL raises the key's limit.
+DHL_API_KEY = os.getenv("DHL_API_KEY", "")
+DHL_API_MIN_INTERVAL = float(os.getenv("DHL_API_MIN_INTERVAL", "5"))
+# FedEx: developer.fedex.com -> a project with the "Track API".
+FEDEX_API_KEY = os.getenv("FEDEX_API_KEY", "")
+FEDEX_SECRET_KEY = os.getenv("FEDEX_SECRET_KEY", "")
+FEDEX_API_URL = os.getenv("FEDEX_API_URL", "https://apis.fedex.com")
 
 # ---------------------------------------------------------------------------
 # CACHE + BACKGROUND REFRESH
