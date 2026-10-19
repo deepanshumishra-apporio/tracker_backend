@@ -46,7 +46,11 @@ def proxy_or_none() -> Optional[str]:
 # the FedEx scraper fetches the rendered page through Scrape.do (residential IP +
 # headless render) instead of driving a local browser. Get the token from your
 # Scrape.do dashboard. Leave empty to use the SeleniumBase browser path instead.
-SCRAPEDO_TOKEN = os.getenv("SCRAPEDO_TOKEN", "")
+SCRAPEDO_TOKEN = os.getenv("SCRAPEDO_TOKEN", "").strip()
+# The value tracker.env.example used to ship is not a token: copied as-is, it
+# routed FedEx through Scrape.do, which refused every call with HTTP 401.
+if SCRAPEDO_TOKEN.lower().startswith("your-"):
+    SCRAPEDO_TOKEN = ""
 # Country to route through (Scrape.do geoCode). FedEx is US-facing → "us".
 SCRAPEDO_GEO = os.getenv("SCRAPEDO_GEO", "us")
 
