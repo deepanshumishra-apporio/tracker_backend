@@ -22,3 +22,7 @@ latest_logs/
 *.log
 .DS_Store
 Thumbs.db
+
+# load-test inputs/reports (customer tracking numbers)
+loadtest_*.csv
+loadtest-*.json
