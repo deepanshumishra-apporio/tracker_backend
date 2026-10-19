@@ -20,7 +20,10 @@ def _isolated(monkeypatch, tmp_path):
       tests of the fast path install their own fake fetchers.
     * Results are now saved on every lookup, so each test gets its own DB.
     * The background refresher stays off.
+    * The always-on browser pool stays off; its own tests start one.
     """
     monkeypatch.setattr(tracking_service, "FAST", {})
     monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "test.db"))
     monkeypatch.setattr(config, "REFRESH_ENABLED", False)
+    monkeypatch.setattr(config, "BROWSER_POOL_SIZE", 0)
+    monkeypatch.setattr(tracking_service, "POOL", None)

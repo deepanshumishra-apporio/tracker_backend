@@ -38,6 +38,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 import batch
+import browser_pool
 import config
 import storage
 import tracking_service
@@ -188,13 +189,26 @@ def _xlsx_response(data: bytes, filename: str) -> Response:
 
 def create_app() -> FastAPI:
     refresher = tracking_service.Refresher(browser_session)
+    pool = browser_pool.BrowserPool(
+        SCRAPERS,
+        size=config.BROWSER_POOL_SIZE,
+        carriers=[Carrier(c) for c in config.BROWSER_POOL_CARRIERS if c in Carrier._value2member_map_],
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        # The pool is installed only while its workers run: a lookup that
+        # found it installed but not started would wait forever.
+        pool.start()
+        if pool.size:
+            tracking_service.POOL = pool
         if config.REFRESH_ENABLED:
             refresher.start()
         yield
         refresher.stop()
+        if tracking_service.POOL is pool:
+            tracking_service.POOL = None
+        pool.stop()
 
     app = FastAPI(
         lifespan=lifespan,
@@ -240,6 +254,7 @@ def create_app() -> FastAPI:
             "status": "ok",
             "fast_path": sorted(c.value for c in tracking_service.FAST),
             "last_refresh": refresher.last_sweep or None,
+            "browser_pool": pool.status() if tracking_service.POOL is pool else None,
         }
 
     # Sync `def` (not async) so FastAPI runs the blocking lookup in a threadpool

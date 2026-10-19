@@ -87,6 +87,16 @@ BATCH_CONCURRENCY = max(1, int(os.getenv("BATCH_CONCURRENCY", "1")))
 # systems watch for — so trade a launch every N numbers for a fresh identity.
 SESSION_MAX_LOOKUPS = max(1, int(os.getenv("SESSION_MAX_LOOKUPS", "25")))
 
+# Always-on browser workers (browser_pool.py) for the carriers that need a real
+# browser. Each worker keeps one Chrome open for the life of the app and pulls
+# numbers from a shared queue, so this is how many Chromes run at once — about
+# 0.5-1 GB each. A 2 GB VM holds ONE; set 1 there. 0 turns the pool off (each
+# run opens its own browser per carrier, one page at a time).
+BROWSER_POOL_SIZE = max(0, int(os.getenv("BROWSER_POOL_SIZE", "4")))
+BROWSER_POOL_CARRIERS = [
+    c.strip().lower() for c in os.getenv("BROWSER_POOL_CARRIERS", "fedex,dhl").split(",") if c.strip()
+]
+
 MIN_DELAY = float(os.getenv("MIN_DELAY", "5"))
 MAX_DELAY = float(os.getenv("MAX_DELAY", "20"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))

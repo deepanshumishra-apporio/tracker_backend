@@ -8,7 +8,8 @@ One entry point for tracking: cache -> fast HTTP fetcher -> browser scraper.
     many numbers in parallel.
   * Fallback: anything the fast path could not get an answer for (blocked,
     timeout, no fast fetcher for that carrier) goes through the browser
-    scrapers, one shared browser per carrier.
+    scrapers: the always-on browser pool (POOL) for the carriers it serves,
+    otherwise one browser per carrier for the run.
 
 The background Refresher keeps undelivered shipments current so that most
 lookups are cache hits.
@@ -18,7 +19,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
@@ -53,6 +54,10 @@ def _build_fast() -> dict[Carrier, Any]:
 
 # Tests replace this with fakes (or {} to force the browser path).
 FAST: dict[Carrier, Any] = _build_fast()
+
+# The always-on browser workers (browser_pool.BrowserPool), installed by the app
+# while it runs. None: each run opens its own browser per carrier instead.
+POOL: Optional[Any] = None
 
 _db_lock = threading.Lock()
 
@@ -105,22 +110,50 @@ def _store(result: TrackingResult) -> TrackingResult:
 # Tracking
 # ---------------------------------------------------------------------------
 def _browser(carrier: Carrier, numbers: list[str], session_factory: SessionFactory,
-             cancelled: Callable[[], bool]) -> dict[str, TrackingResult]:
-    out: dict[str, TrackingResult] = {}
+             cancelled: Callable[[], bool], emit: Callable[[str, TrackingResult], None],
+             priority: bool = False) -> None:
+    """Look numbers up in the browser, reporting each through emit() as it lands."""
+    pool = POOL
+    if pool is not None and pool.handles(carrier):
+        _pooled(pool, carrier, numbers, cancelled, emit, priority)
+        return
+    done: set[str] = set()
     try:
         with session_factory(carrier) as track:
             for n in numbers:
                 if cancelled():
                     break
                 try:
-                    out[n] = track(n)
+                    result = track(n)
                 except Exception as exc:
-                    out[n] = TrackingResult.failure(n, carrier, humanize_error(exc))
+                    result = TrackingResult.failure(n, carrier, humanize_error(exc))
+                done.add(n)
+                emit(n, result)
     except Exception as exc:  # the browser itself would not start
         msg = humanize_error(exc)
         for n in numbers:
-            out.setdefault(n, TrackingResult.failure(n, carrier, msg))
-    return out
+            if n not in done and not cancelled():
+                emit(n, TrackingResult.failure(n, carrier, msg))
+
+
+def _pooled(pool: Any, carrier: Carrier, numbers: list[str], cancelled: Callable[[], bool],
+            emit: Callable[[str, TrackingResult], None], priority: bool) -> None:
+    """Hand every number to the always-on browsers at once, so they work it in
+    parallel, and report each as it finishes."""
+    futures = {pool.submit(carrier, n, priority=priority): n for n in numbers}
+    waiting = set(futures)
+    while waiting:
+        if cancelled():
+            pool.cancel(waiting)
+            return
+        finished, waiting = wait(waiting, timeout=1, return_when=FIRST_COMPLETED)
+        for fut in finished:
+            n = futures[fut]
+            if fut.cancelled():   # the pool shut down, or another caller dropped it
+                continue
+            exc = fut.exception()
+            emit(n, TrackingResult.failure(n, carrier, humanize_error(exc)) if exc
+                 else fut.result())
 
 
 def track_many(
@@ -131,9 +164,11 @@ def track_many(
     cancelled: Callable[[], bool] = lambda: False,
     use_cache: bool = True,
     fallback: bool = True,
+    priority: bool = False,
 ) -> dict[Key, TrackingResult]:
     """Track every (carrier, number). Results are saved as they arrive and
-    reported through on_result(carrier, number, result, from_cache)."""
+    reported through on_result(carrier, number, result, from_cache).
+    priority puts browser lookups ahead of the pool's backlog (single lookups)."""
     results: dict[Key, TrackingResult] = {}
     lock = threading.Lock()
 
@@ -169,8 +204,8 @@ def track_many(
                 log.info("fast %s: %d/%d need the browser", carrier.value,
                          len(leftover), len(numbers))
         if leftover and fallback and not cancelled():
-            for n, r in _browser(carrier, leftover, session_factory, cancelled).items():
-                emit(carrier, n, r, False)
+            _browser(carrier, leftover, session_factory, cancelled,
+                     lambda n, r: emit(carrier, n, r, False), priority)
 
     # Carriers run side by side: Aramex's HTTP calls don't wait behind a UPS
     # browser warm-up, nor DHL's browser behind either.
@@ -186,7 +221,7 @@ def track_one(carrier: Carrier, number: str, session_factory: SessionFactory,
         hit = cached(carrier, number)
         if hit is not None:
             return hit, True
-    out = track_many([(carrier, number)], session_factory, use_cache=False)
+    out = track_many([(carrier, number)], session_factory, use_cache=False, priority=True)
     return out[(carrier, number)], False
 
 
